@@ -107,7 +107,7 @@ Options:
 Built on x86-64 with musl:
 
 ```text
-binary:     115K
+binary:     42,488 bytes (34,632 stripped)
 text:       24,416 bytes
 data:          960 bytes
 bss:           456 bytes

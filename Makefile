@@ -1,98 +1,50 @@
-CC      = cc
-CFLAGS  = -O2 -g
-WARN    = -std=c89 -pedantic -Wall -Wextra
-DEFS    = -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
-THREADS = -pthread
+TARGET   = civet
+
+CFLAGS  ?= -O2
+WARN     = -std=c89 -pedantic -Wall -Wextra
+DEFS     = -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
+THREADS  = -pthread
+DEPFLAGS = -MMD -MP
+
+STRIP   ?= strip
+PREFIX  ?= /usr/local
+BINDIR   = $(PREFIX)/bin
+DESTDIR ?=
+
+# make DEBUG=1   runtime debug logging + -g
+DEBUG ?= 0
 
 ifeq ($(DEBUG),1)
-DEFS += -DDEBUG
+DEFS   += -DDEBUG
+CFLAGS += -g
 endif
 
-TARGET  = civet
+SRCS = main.c allowed_chars.c port.c request_parser.c \
+       vfs.c vfs_server.c cache.c server.c server_threads.c
+OBJS = $(SRCS:.c=.o)
+DEPS = $(OBJS:.o=.d)
 
-PREFIX  = /usr/local
-BINDIR  = $(PREFIX)/bin
-DESTDIR =
-
-OBJS    = main.o \
-          allowed_chars.o \
-          port.o \
-          request_parser.o \
-          vfs.o \
-          vfs_server.o \
-          cache.o \
-          server.o \
-          server_threads.o
+.SUFFIXES:
+.DELETE_ON_ERROR:
+.PHONY: all install uninstall clean
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(THREADS) $(LDFLAGS) -o $@ $(OBJS)
+	$(CC) $(LDFLAGS) $(THREADS) -o $@ $(OBJS) $(LDLIBS)
 
-.c.o:
-	$(CC) $(CFLAGS) $(WARN) $(DEFS) $(THREADS) -c $<
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARN) $(DEFS) $(THREADS) $(DEPFLAGS) -c -o $@ $<
 
-main.o: main.c \
-        lib.h \
-        port.h \
-        allowed_chars.h \
-        vfs.h \
-        vfs_server.h \
-        cache.h \
-        server.h
-
-allowed_chars.o: allowed_chars.c \
-                 allowed_chars.h \
-                 lib.h
-
-port.o: port.c \
-        port.h \
-        lib.h
-
-request_parser.o: request_parser.c \
-                  request_parser.h \
-                  allowed_chars.h \
-                  lib.h
-
-vfs.o: vfs.c \
-       vfs.h \
-       lib.h
-
-vfs_server.o: vfs_server.c \
-              vfs_server.h \
-              vfs.h \
-              lib.h
-
-cache.o: cache.c \
-         cache.h \
-         vfs.h \
-         vfs_server.h \
-         lib.h
-
-server.o: server.c \
-          server.h \
-          server_threads.h \
-          vfs.h \
-          vfs_server.h \
-          cache.h \
-          lib.h
-
-server_threads.o: server_threads.c \
-                  server_threads.h \
-                  request_parser.h \
-                  vfs.h \
-                  vfs_server.h \
-                  cache.h \
-                  lib.h
+-include $(DEPS)
 
 install: $(TARGET)
 	mkdir -p $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+	$(STRIP) -s $(DESTDIR)$(BINDIR)/$(TARGET)
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
 
 clean:
-	rm -f $(OBJS) $(TARGET)
-
-.PHONY: all install uninstall clean
+	rm -f $(OBJS) $(DEPS) $(TARGET)
