@@ -1,0 +1,26 @@
+.DS_Store
+.idea
+*.log
+tmp/
+
+civet
+# build output
+/build/
+/httpd
+*.o
+*.d
+*.a
+
+# editor / OS junk
+*~
+\#*\#
+.\#*
+*.swp
+.DS_Store
+
+# debugging
+core
+core.*
+vgcore.*
+compile_commands.json
+.cache/
