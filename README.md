@@ -99,20 +99,32 @@ Options:
 * C compiler
 * `make`
 
+
+
 ## Size
 
 (`version 0.0.1`)
 Built on x86-64 with musl:
 
 ```text
-file:       ELF 64-bit LSB pie executable, x86-64
 binary:     115K
 text:       24,416 bytes
 data:          960 bytes
 bss:           456 bytes
 total:      25,832 bytes (25.2 KiB)
 ```
+For comparison, [quark](https://git.suckless.org/quark/) built from commit
+5ad0df91757fbc577ffceeca633725e962da345d:
 
+```
+binary:     42K
+text:       29,154 bytes
+data:        6,000 bytes
+bss:         4,208 bytes
+total:      39,362 bytes (38.4 KiB)
+```
+
+Civet's text/data/bss footprint is ~34% smaller.
 
 ## License
 
