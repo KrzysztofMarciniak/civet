@@ -99,6 +99,21 @@ Options:
 * C compiler
 * `make`
 
+## Size
+
+(`version 0.0.1`)
+Built on x86-64 with musl:
+
+```text
+file:       ELF 64-bit LSB pie executable, x86-64
+binary:     115K
+text:       24,416 bytes
+data:          960 bytes
+bss:           456 bytes
+total:      25,832 bytes (25.2 KiB)
+```
+
+
 ## License
 
 See the project source for license information.
