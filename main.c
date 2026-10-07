@@ -1,308 +1,164 @@
-/* main.c - entry point, and the source of truth for what the server does.
- *
- * Everything the server needs to know is collected into `struct config`
- * here, once, at startup. Other modules receive it, they don't parse
- * arguments or look at the environment themselves.
- */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <limits.h>
-
-#include <sys/types.h>
-#include <sys/stat.h>
-
-#include <unistd.h>
-
-#include "vfs.h"
-#include "cache.h"
-#include "server.h"
 #include "lib.h"
 #include "port.h"
 #include "allowed_chars.h"
+#include "vfs.h"
+#include "vfs_server.h"
+#include "cache.h"
+#include "server.h"
 
-#define PROG_NAME     "civet"
-#define PROG_VERSION  "0.1"
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#define DEFAULT_BIND  "127.0.0.1"
+#define PROG_NAME "civet"
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
+#define EXIT_OK      0
+#define EXIT_USAGE   2
+#define EXIT_RUNTIME 1
 
-#define EXIT_RUNTIME  1
-#define EXIT_USAGE    2
-
-#define PARSE_OK      0
-#define PARSE_QUIT    1
-#define PARSE_ERR    (-1)
-
-/* ------------------------------------------------------------------ */
-/* help                                                                */
-/* ------------------------------------------------------------------ */
-
-static void usage(FILE *out)
+static void usage(const char *prog)
 {
-    fputs("Usage: " PROG_NAME " [options] [DIRECTORY]\n"
-          "\n"
-          "Serve the files in DIRECTORY over HTTP (GET and HEAD only).\n"
-          "DIRECTORY defaults to the current directory.\n"
-          "\n", out);
-
-    fputs("Options:\n"
-          "  -r, --root DIR    directory to serve (same as DIRECTORY)\n"
-          "  -p, --port N      TCP port to listen on     (default "
-          "8080)\n"
-          "  -b, --bind ADDR   IPv4 address to listen on (default "
-          DEFAULT_BIND ")\n"
-          "                    use 0.0.0.0 to accept connections from "
-          "anywhere\n"
-          "  -c, --cache PATHS comma-separated files to cache in memory\n"
-          "                    e.g. -c index.html,css/style.css\n", out);
-
-    fputs("  -h, --help        show this help and exit\n"
-          "  -v, --version     show version and exit\n"
-          "\n", out);
+    fprintf(stderr,
+            "usage: %s [-b address] [-p port] -r root [-c paths]\n"
+            "\n"
+            "  -b address   bind address (default: 127.0.0.1)\n"
+            "  -p port      listen port (default: 8080)\n"
+            "  -r root      document root\n"
+            "  -c paths     comma-separated cache paths\n",
+            prog);
 }
 
-/* ------------------------------------------------------------------ */
-/* argument parsing                                                    */
-/* ------------------------------------------------------------------ */
-
-/* Fetch the value that follows option argv[*i]; advances *i. */
-static const char *need_arg(int argc, char **argv, s4 *i)
+static s4 resolve_root(const char *input,
+                       char *output,
+                       size_t output_size)
 {
-    if (*i + 1 >= argc) {
-        fprintf(stderr,
-                PROG_NAME ": option '%s' needs a value\n",
-                argv[*i]);
-        return NULL;
-    }
-
-    *i += 1;
-
-    return argv[*i];
-}
-
-static s4 set_root(struct config *cfg, const char *dir)
-{
-    if (cfg->root_arg != NULL) {
-        fprintf(stderr,
-                PROG_NAME ": more than one directory given "
-                "('%s' and '%s')\n",
-                cfg->root_arg,
-                dir);
-        return -1;
-    }
-
-    cfg->root_arg = dir;
-
-    return 0;
-}
-
-static s4 parse_args(int argc, char **argv, struct config *cfg)
-{
-    s4 i;
-    s4 opts_done;
-    const char *a;
-    const char *v;
-
-    opts_done = 0;
-
-    for (i = 1; i < argc; i++) {
-        a = argv[i];
-
-        if (opts_done || a[0] != '-' || a[1] == '\0') {
-            if (set_root(cfg, a) != 0)
-                return PARSE_ERR;
-        }
-        else if (strcmp(a, "--") == 0) {
-            opts_done = 1;
-        }
-        else if (strcmp(a, "-h") == 0 ||
-                 strcmp(a, "--help") == 0) {
-            usage(stdout);
-            return PARSE_QUIT;
-        }
-        else if (strcmp(a, "-v") == 0 ||
-                 strcmp(a, "--version") == 0) {
-            puts(PROG_NAME " " PROG_VERSION);
-            return PARSE_QUIT;
-        }
-        else if (strcmp(a, "-p") == 0 ||
-                 strcmp(a, "--port") == 0) {
-            v = need_arg(argc, argv, &i);
-
-            if (v == NULL)
-                return PARSE_ERR;
-
-            if (parse_port(v, &cfg->port) != 0) {
-                fprintf(stderr,
-                        PROG_NAME ": invalid port '%s' "
-                        "(want 1-65535)\n",
-                        v);
-                return PARSE_ERR;
-            }
-        }
-        else if (strcmp(a, "-b") == 0 ||
-                 strcmp(a, "--bind") == 0) {
-            v = need_arg(argc, argv, &i);
-
-            if (v == NULL)
-                return PARSE_ERR;
-
-            cfg->bind_addr = v;
-        }
-        else if (strcmp(a, "-r") == 0 ||
-                 strcmp(a, "--root") == 0) {
-            v = need_arg(argc, argv, &i);
-
-            if (v == NULL)
-                return PARSE_ERR;
-
-            if (set_root(cfg, v) != 0)
-                return PARSE_ERR;
-        }
-        else if (strcmp(a, "-c") == 0 ||
-                 strcmp(a, "--cache") == 0) {
-            v = need_arg(argc, argv, &i);
-
-            if (v == NULL)
-                return PARSE_ERR;
-
-            cfg->cache_arg = v;
-        }
-        else {
-            fprintf(stderr,
-                    PROG_NAME ": unknown option '%s'\n",
-                    a);
-            return PARSE_ERR;
-        }
-    }
-
-    return PARSE_OK;
-}
-
-/* ------------------------------------------------------------------ */
-/* document root                                                       */
-/* ------------------------------------------------------------------ */
-
-/*
- * Turn the supplied directory into a canonical absolute path.
- *
- * This happens BEFORE the VFS is built. The VFS therefore receives
- * one trusted, canonical filesystem root.
- */
-static s4 resolve_root(struct config *cfg)
-{
+    char resolved[PATH_MAX];
     struct stat st;
-    const char *arg;
 
-    arg = (cfg->root_arg != NULL)
-        ? cfg->root_arg
-        : ".";
-
-    if (realpath(arg, cfg->root) == NULL) {
+    if (realpath(input, resolved) == NULL) {
         fprintf(stderr,
-                PROG_NAME ": cannot use '%s': %s\n",
-                arg,
+                PROG_NAME ": cannot resolve root '%s': %s\n",
+                input,
                 strerror(errno));
         return -1;
     }
 
-    if (stat(cfg->root, &st) != 0 ||
-        !S_ISDIR(st.st_mode)) {
+    if (stat(resolved, &st) < 0) {
         fprintf(stderr,
-                PROG_NAME ": '%s' is not a directory\n",
-                cfg->root);
-        return -1;
-    }
-
-    if (access(cfg->root, R_OK | X_OK) != 0) {
-        fprintf(stderr,
-                PROG_NAME ": '%s' is not readable: %s\n",
-                cfg->root,
+                PROG_NAME ": cannot stat root '%s': %s\n",
+                resolved,
                 strerror(errno));
         return -1;
     }
+
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr,
+                PROG_NAME ": root '%s' is not a directory\n",
+                resolved);
+        return -1;
+    }
+
+    if (access(resolved, R_OK | X_OK) < 0) {
+        fprintf(stderr,
+                PROG_NAME ": cannot access root '%s': %s\n",
+                resolved,
+                strerror(errno));
+        return -1;
+    }
+
+    if (strlen(resolved) + 1 > output_size) {
+        fprintf(stderr,
+                PROG_NAME ": root path is too long\n");
+        return -1;
+    }
+
+    strcpy(output, resolved);
 
     return 0;
 }
-
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
 {
     struct config cfg;
     struct vfs vfs;
+    struct vfs_server vfs_server;
     struct cache cache;
+    int opt;
     s4 r;
 
-    /*
-     * Initialize character classification before anything that
-     * depends on it.
-     */
-    ac_init();
-
-    /*
-     * Establish configuration defaults.
-     */
-    cfg.bind_addr = DEFAULT_BIND;
-    cfg.port      = DEFAULT_PORT;
-    cfg.root_arg  = NULL;
+    cfg.bind_addr = "127.0.0.1";
+    cfg.port = 8080;
+    cfg.root_arg = NULL;
+    cfg.root[0] = '\0';
     cfg.cache_arg = NULL;
-    cfg.root[0]   = '\0';
 
-    /*
-     * Parse command line.
-     */
-    r = parse_args(argc, argv, &cfg);
+    while ((opt = getopt(argc, argv, "b:p:r:c:")) != -1) {
+        switch (opt) {
+        case 'b':
+            cfg.bind_addr = optarg;
+            break;
 
-    if (r == PARSE_QUIT)
-        return 0;
+        case 'p':
+            if (parse_port(optarg, &cfg.port) != 0) {
+                fprintf(stderr,
+                        PROG_NAME ": invalid port '%s'\n",
+                        optarg);
+                return EXIT_USAGE;
+            }
+            break;
 
-    if (r == PARSE_ERR) {
-        fputs("Try '" PROG_NAME
-              " --help' for more information.\n",
-              stderr);
+        case 'r':
+            cfg.root_arg = optarg;
+            break;
+
+        case 'c':
+            cfg.cache_arg = optarg;
+            break;
+
+        default:
+            usage(argv[0]);
+            return EXIT_USAGE;
+        }
+    }
+
+    if (cfg.root_arg == NULL) {
+        usage(argv[0]);
         return EXIT_USAGE;
     }
 
-    /*
-     * Resolve and validate the filesystem root FIRST.
-     *
-     * vfs_init() depends on cfg.root containing a valid canonical
-     * directory path.
-     */
-    if (resolve_root(&cfg) != 0)
+    if (optind != argc) {
+        usage(argv[0]);
+        return EXIT_USAGE;
+    }
+
+    if (resolve_root(cfg.root_arg,
+                     cfg.root,
+                     sizeof(cfg.root)) != 0)
         return EXIT_RUNTIME;
 
-    /*
-     * Build the virtual filesystem.
-     *
-     * From this point onward, request handling should use the VFS
-     * rather than constructing filesystem paths from HTTP input.
-     */
+    ac_init();
+
     if (vfs_init(&vfs, cfg.root) != VFS_OK)
         return EXIT_RUNTIME;
 
-    /*
-     * Initialize the in-memory cache.
-     *
-     * The cache is separate from the VFS: the VFS indexes files,
-     * while the cache optionally stores selected file contents.
-     */
+    if (vfs_server_init(&vfs_server, cfg.root) != VFS_OK) {
+        vfs_destroy(&vfs);
+        return EXIT_RUNTIME;
+    }
+
     cache_init(&cache);
 
     if (cfg.cache_arg != NULL) {
         if (cache_load(&cache,
                        &vfs,
+                       &vfs_server,
                        cfg.cache_arg) != CACHE_OK) {
             cache_destroy(&cache);
+            vfs_server_destroy(&vfs_server);
             vfs_destroy(&vfs);
             return EXIT_RUNTIME;
         }
@@ -316,23 +172,14 @@ int main(int argc, char **argv)
             cfg.bind_addr,
             (unsigned)cfg.port);
 
-    /*
-     * server_run() does not own the VFS or cache.
-     * main() owns both for the lifetime of the server.
-     */
     r = server_run(&cfg,
                    &vfs,
+                   &vfs_server,
                    &cache);
 
-    /*
-     * Normally server_run() runs forever. If it eventually returns,
-     * release the cache and VFS before exiting.
-     */
     cache_destroy(&cache);
+    vfs_server_destroy(&vfs_server);
     vfs_destroy(&vfs);
 
-    if (r != 0)
-        return EXIT_RUNTIME;
-
-    return 0;
+    return r == 0 ? EXIT_OK : EXIT_RUNTIME;
 }

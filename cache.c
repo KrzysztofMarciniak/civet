@@ -10,19 +10,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include <fcntl.h>
 #include <unistd.h>
 
-/*
- * Maximum total amount of file data held by the cache.
- *
- * This is deliberately a compile-time limit for now. The command-line
- * configuration can expose this later if we want it tunable.
- */
 #define CACHE_MAX_BYTES (256UL * 1024UL * 1024UL)
 
-/* ------------------------------------------------------------------ */
-/* Internal helpers.                                                   */
 /* ------------------------------------------------------------------ */
 
 static void cache_entry_free(struct cache_entry *entry)
@@ -35,16 +26,8 @@ static void cache_entry_free(struct cache_entry *entry)
     free(entry);
 }
 
-/*
- * Convert a cache argument into a normalized VFS path.
- *
- * Both of these are accepted:
- *
- *     index.html
- *     /index.html
- *
- * The VFS remains responsible for path normalization and security.
- */
+/* ------------------------------------------------------------------ */
+
 static s4 normalize_cache_path(const char *input,
                                char *output,
                                size_t output_size)
@@ -74,7 +57,10 @@ static s4 normalize_cache_path(const char *input,
         return CACHE_ERROR;
 
     rooted[0] = '/';
-    memcpy(rooted + 1, input, len + 1);
+
+    memcpy(rooted + 1,
+           input,
+           len + 1);
 
     return vfs_normalize_path(rooted,
                               output,
@@ -83,8 +69,6 @@ static s4 normalize_cache_path(const char *input,
         : CACHE_ERROR;
 }
 
-/* ------------------------------------------------------------------ */
-/* Initialize cache.                                                   */
 /* ------------------------------------------------------------------ */
 
 void cache_init(struct cache *cache)
@@ -97,8 +81,6 @@ void cache_init(struct cache *cache)
     cache->total_bytes = 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Destroy cache.                                                      */
 /* ------------------------------------------------------------------ */
 
 void cache_destroy(struct cache *cache)
@@ -123,10 +105,9 @@ void cache_destroy(struct cache *cache)
 }
 
 /* ------------------------------------------------------------------ */
-/* Read an entire regular file into memory.                            */
-/* ------------------------------------------------------------------ */
 
-static s4 read_file(const char *path,
+static s4 read_file(const struct vfs_server *vfs_server,
+                    const struct vfs_entry *entry,
                     char **content,
                     size_t *size)
 {
@@ -137,18 +118,21 @@ static s4 read_file(const char *path,
     size_t used;
     ssize_t n;
 
-    if (content == NULL || size == NULL)
+    if (vfs_server == NULL ||
+        entry == NULL ||
+        content == NULL ||
+        size == NULL)
         return CACHE_ERROR;
 
     *content = NULL;
     *size = 0;
 
-    fd = open(path, O_RDONLY);
+    fd = vfs_server_open(vfs_server, entry);
 
     if (fd < 0) {
         fprintf(stderr,
                 "civet: cannot open cache file '%s': %s\n",
-                path,
+                entry->url_path,
                 strerror(errno));
         return CACHE_ERROR;
     }
@@ -156,7 +140,7 @@ static s4 read_file(const char *path,
     if (fstat(fd, &st) != 0) {
         fprintf(stderr,
                 "civet: cannot stat cache file '%s': %s\n",
-                path,
+                entry->url_path,
                 strerror(errno));
         close(fd);
         return CACHE_ERROR;
@@ -165,7 +149,7 @@ static s4 read_file(const char *path,
     if (!S_ISREG(st.st_mode)) {
         fprintf(stderr,
                 "civet: cache path is not a regular file: '%s'\n",
-                path);
+                entry->url_path);
         close(fd);
         return CACHE_ERROR;
     }
@@ -173,20 +157,16 @@ static s4 read_file(const char *path,
     if (st.st_size < 0) {
         fprintf(stderr,
                 "civet: invalid cache file size: '%s'\n",
-                path);
+                entry->url_path);
         close(fd);
         return CACHE_ERROR;
     }
 
-    /*
-     * A single file can never consume more than the total cache limit.
-     * This also keeps the size conversion and allocation bounded.
-     */
     if ((unsigned long)st.st_size > CACHE_MAX_BYTES) {
         fprintf(stderr,
                 "civet: cache file is too large: '%s' "
                 "(maximum %lu bytes)\n",
-                path,
+                entry->url_path,
                 CACHE_MAX_BYTES);
         close(fd);
         return CACHE_ERROR;
@@ -194,10 +174,6 @@ static s4 read_file(const char *path,
 
     wanted = (size_t)st.st_size;
 
-    /*
-     * malloc(0) is implementation-defined, so allocate one byte for
-     * an empty file. The recorded size remains zero, so no byte is sent.
-     */
     if (wanted == 0)
         buf = (char *)malloc(1);
     else
@@ -206,7 +182,7 @@ static s4 read_file(const char *path,
     if (buf == NULL) {
         fprintf(stderr,
                 "civet: cannot cache '%s': out of memory\n",
-                path);
+                entry->url_path);
         close(fd);
         return CACHE_ERROR;
     }
@@ -224,7 +200,7 @@ static s4 read_file(const char *path,
 
             fprintf(stderr,
                     "civet: cannot read cache file '%s': %s\n",
-                    path,
+                    entry->url_path,
                     strerror(errno));
 
             free(buf);
@@ -235,7 +211,7 @@ static s4 read_file(const char *path,
         if (n == 0) {
             fprintf(stderr,
                     "civet: unexpected EOF while caching '%s'\n",
-                    path);
+                    entry->url_path);
 
             free(buf);
             close(fd);
@@ -248,7 +224,7 @@ static s4 read_file(const char *path,
     if (close(fd) != 0) {
         fprintf(stderr,
                 "civet: cannot close cache file '%s': %s\n",
-                path,
+                entry->url_path,
                 strerror(errno));
 
         free(buf);
@@ -262,10 +238,9 @@ static s4 read_file(const char *path,
 }
 
 /* ------------------------------------------------------------------ */
-/* Add one file to the cache.                                          */
-/* ------------------------------------------------------------------ */
 
 static s4 cache_add(struct cache *cache,
+                    const struct vfs_server *vfs_server,
                     const struct vfs_entry *entry,
                     const char *url_path)
 {
@@ -274,6 +249,7 @@ static s4 cache_add(struct cache *cache,
     size_t size;
 
     if (cache == NULL ||
+        vfs_server == NULL ||
         entry == NULL ||
         url_path == NULL)
         return CACHE_ERROR;
@@ -281,16 +257,9 @@ static s4 cache_add(struct cache *cache,
     if (entry->type != VFS_FILE)
         return CACHE_ERROR;
 
-    /*
-     * Do this before opening the file. A duplicate should not cause
-     * another disk read.
-     */
     if (cache_lookup(cache, url_path) != NULL)
         return CACHE_OK;
 
-    /*
-     * Don't even read a file that cannot fit in the remaining cache.
-     */
     if (entry->size < 0 ||
         (unsigned long)entry->size >
         CACHE_MAX_BYTES - cache->total_bytes) {
@@ -300,15 +269,12 @@ static s4 cache_add(struct cache *cache,
         return CACHE_ERROR;
     }
 
-    if (read_file(entry->disk_path,
+    if (read_file(vfs_server,
+                  entry,
                   &content,
                   &size) != CACHE_OK)
         return CACHE_ERROR;
 
-    /*
-     * The file may have changed between VFS startup and cache loading.
-     * Check the actual bytes we read against the remaining capacity.
-     */
     if (size > CACHE_MAX_BYTES - cache->total_bytes) {
         fprintf(stderr,
                 "civet: cache limit exceeded by '%s'\n",
@@ -356,15 +322,15 @@ static s4 cache_add(struct cache *cache,
 }
 
 /* ------------------------------------------------------------------ */
-/* Load one cache path.                                                 */
-/* ------------------------------------------------------------------ */
 
 static s4 cache_load_one(struct cache *cache,
                          const struct vfs *vfs,
+                         const struct vfs_server *vfs_server,
                          const char *input)
 {
     char normalized[PATH_MAX];
     const struct vfs_entry *entry;
+    const struct cache_entry *cached;
 
     if (normalize_cache_path(input,
                              normalized,
@@ -391,39 +357,41 @@ static s4 cache_load_one(struct cache *cache,
         return CACHE_ERROR;
     }
 
-    /*
-     * cache_add() also checks this, but keeping the check here avoids
-     * doing any unnecessary work and makes the intent of this function
-     * explicit.
-     */
     if (cache_lookup(cache, normalized) != NULL)
         return CACHE_OK;
 
     if (cache_add(cache,
+                  vfs_server,
                   entry,
                   normalized) != CACHE_OK)
+        return CACHE_ERROR;
+
+    cached = cache_lookup(cache, normalized);
+
+    if (cached == NULL)
         return CACHE_ERROR;
 
     fprintf(stderr,
             "civet: cached %s (%lu bytes)\n",
             normalized,
-            (unsigned long)cache_lookup(cache, normalized)->size);
+            (unsigned long)cached->size);
 
     return CACHE_OK;
 }
 
 /* ------------------------------------------------------------------ */
-/* Load comma-separated cache paths.                                   */
-/* ------------------------------------------------------------------ */
 
 s4 cache_load(struct cache *cache,
               const struct vfs *vfs,
+              const struct vfs_server *vfs_server,
               const char *paths)
 {
     char *list;
     char *token;
 
-    if (cache == NULL || vfs == NULL)
+    if (cache == NULL ||
+        vfs == NULL ||
+        vfs_server == NULL)
         return CACHE_ERROR;
 
     if (paths == NULL || *paths == '\0')
@@ -442,9 +410,6 @@ s4 cache_load(struct cache *cache,
     while (token != NULL) {
         char *end;
 
-        /*
-         * Permit whitespace around comma-separated paths.
-         */
         while (*token == ' ' ||
                *token == '\t')
             token++;
@@ -467,6 +432,7 @@ s4 cache_load(struct cache *cache,
 
         if (cache_load_one(cache,
                            vfs,
+                           vfs_server,
                            token) != CACHE_OK) {
             free(list);
             return CACHE_ERROR;
@@ -481,13 +447,12 @@ s4 cache_load(struct cache *cache,
             "civet: cache contains %lu files (%lu bytes, %lu MiB max)\n",
             (unsigned long)cache->entry_count,
             (unsigned long)cache->total_bytes,
-            (unsigned long)(CACHE_MAX_BYTES / (1024UL * 1024UL)));
+            (unsigned long)(CACHE_MAX_BYTES /
+                            (1024UL * 1024UL)));
 
     return CACHE_OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* Lookup.                                                              */
 /* ------------------------------------------------------------------ */
 
 const struct cache_entry *

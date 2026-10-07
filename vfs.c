@@ -1,5 +1,3 @@
-/* vfs.c - virtual filesystem index for the configured HTTP root. */
-
 #include "vfs.h"
 
 #include <stdio.h>
@@ -7,74 +5,132 @@
 #include <string.h>
 #include <errno.h>
 
-#include <sys/stat.h>
 #include <dirent.h>
-
 #include <unistd.h>
 
-/* ------------------------------------------------------------------ */
-/* internal helpers                                                    */
-/* ------------------------------------------------------------------ */
+#define VFS_MAX_SCAN_DEPTH 64
+#define VFS_HEX "0123456789ABCDEF"
 
-static char *vfs_strdup(const char *s)
+static int is_url_unreserved(unsigned char c)
 {
-    char *p;
-    size_t len;
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9'))
+        return 1;
 
-    if (s == NULL)
-        return NULL;
-
-    len = strlen(s);
-
-    p = (char *)malloc(len + 1);
-
-    if (p == NULL)
-        return NULL;
-
-    memcpy(p, s, len + 1);
-
-    return p;
+    return c == '-' || c == '.' || c == '_' || c == '~';
 }
 
-static s4 add_entry(struct vfs *vfs,
-                    const char *url_path,
-                    const char *disk_path,
-                    const struct stat *st)
+static size_t url_component_encoded_length(const char *name)
+{
+    const unsigned char *p;
+    size_t n;
+
+    p = (const unsigned char *)name;
+    n = 0;
+
+    while (*p != '\0') {
+        n += is_url_unreserved(*p) ? 1 : 3;
+        p++;
+    }
+
+    return n;
+}
+
+static s4 url_encode_component(const char *name,
+                               char *out,
+                               size_t out_size)
+{
+    const unsigned char *p;
+    size_t n;
+    unsigned char c;
+
+    if (name == NULL || out == NULL || out_size == 0)
+        return VFS_BAD_PATH;
+
+    n = url_component_encoded_length(name);
+
+    if (n >= out_size)
+        return VFS_BAD_PATH;
+
+    p = (const unsigned char *)name;
+    n = 0;
+
+    while (*p != '\0') {
+        c = *p++;
+
+        if (is_url_unreserved(c)) {
+            out[n++] = (char)c;
+        } else {
+            out[n++] = '%';
+            out[n++] = VFS_HEX[(c >> 4) & 0x0F];
+            out[n++] = VFS_HEX[c & 0x0F];
+        }
+    }
+
+    out[n] = '\0';
+    return VFS_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* entries                                                             */
+/* ------------------------------------------------------------------ */
+
+s4 vfs_add(struct vfs *vfs,
+           const char *url_path,
+           const char *rel_path,
+           const struct stat *st)
 {
     struct vfs_entry *entry;
+    char *p;
 
-    entry = (struct vfs_entry *)malloc(sizeof(*entry));
+    size_t url_len;
+    size_t rel_len;
+    size_t total;
+
+    if (vfs == NULL ||
+        url_path == NULL ||
+        rel_path == NULL ||
+        st == NULL)
+        return VFS_ERROR;
+
+    if (!S_ISREG(st->st_mode) &&
+        !S_ISDIR(st->st_mode))
+        return VFS_OK;
+
+    url_len = strlen(url_path);
+    rel_len = strlen(rel_path);
+
+    total = sizeof(*entry);
+
+    if (url_len > (size_t)-1 - 1 - total)
+        return VFS_ERROR;
+
+    total += url_len + 1;
+
+    if (rel_len > (size_t)-1 - 1 - total)
+        return VFS_ERROR;
+
+    total += rel_len + 1;
+
+    entry = (struct vfs_entry *)malloc(total);
 
     if (entry == NULL)
         return VFS_ERROR;
 
-    memset(entry, 0, sizeof(*entry));
+    p = (char *)(entry + 1);
 
-    entry->url_path = vfs_strdup(url_path);
+    entry->url_path = p;
+    memcpy(p, url_path, url_len + 1);
 
-    if (entry->url_path == NULL) {
-        free(entry);
-        return VFS_ERROR;
-    }
+    p += url_len + 1;
 
-    entry->disk_path = vfs_strdup(disk_path);
+    entry->rel_path = p;
+    memcpy(p, rel_path, rel_len + 1);
 
-    if (entry->disk_path == NULL) {
-        free(entry->url_path);
-        free(entry);
-        return VFS_ERROR;
-    }
-
-    if (S_ISREG(st->st_mode))
-        entry->type = VFS_FILE;
-    else if (S_ISDIR(st->st_mode))
-        entry->type = VFS_DIRECTORY;
-    else {
-        free(entry->disk_path);
-        free(entry->url_path);
-        free(entry);
-        return VFS_OK;
-    }
+    entry->type = S_ISDIR(st->st_mode)
+                ? VFS_DIRECTORY
+                : VFS_FILE;
 
     entry->size = st->st_size;
     entry->mtime = st->st_mtime;
@@ -86,160 +142,178 @@ static s4 add_entry(struct vfs *vfs,
     return VFS_OK;
 }
 
-/*
- * Join two filesystem paths.
- *
- * base must already be a directory path.
- */
-static s4 join_disk_path(const char *base,
-                         const char *name,
-                         char *out,
-                         size_t out_size)
+s4 vfs_remove(struct vfs *vfs,
+              const char *url_path)
 {
-    size_t base_len;
-    size_t name_len;
-    size_t needed;
+    struct vfs_entry **p;
+    struct vfs_entry *entry;
 
-    base_len = strlen(base);
-    name_len = strlen(name);
+    if (vfs == NULL || url_path == NULL)
+        return VFS_ERROR;
 
-    if (base_len != 0 && base[base_len - 1] == '/')
-        needed = base_len + name_len + 1;
-    else
-        needed = base_len + 1 + name_len + 1;
+    p = &vfs->entries;
 
-    if (needed > out_size)
-        return -1;
+    while (*p != NULL) {
+        entry = *p;
 
-    memcpy(out, base, base_len);
+        if (strcmp(entry->url_path, url_path) == 0) {
+            *p = entry->next;
+            free(entry);
 
-    if (base_len != 0 && base[base_len - 1] == '/') {
-        memcpy(out + base_len,
-               name,
-               name_len + 1);
-    } else {
-        out[base_len] = '/';
+            vfs->entry_count--;
 
-        memcpy(out + base_len + 1,
-               name,
-               name_len + 1);
+            return VFS_OK;
+        }
+
+        p = &entry->next;
     }
 
-    return 0;
+    return VFS_NOT_FOUND;
 }
 
-/*
- * Append one component to a virtual URL path.
- */
+/* ------------------------------------------------------------------ */
+/* path construction                                                   */
+/* ------------------------------------------------------------------ */
+
 static s4 join_url_path(const char *base,
                         const char *name,
                         char *out,
                         size_t out_size)
 {
     size_t base_len;
+    size_t enc_len;
+    size_t out_len;
+
+    if (base == NULL ||
+        name == NULL ||
+        out == NULL ||
+        out_size == 0)
+        return VFS_BAD_PATH;
+
+    base_len = strlen(base);
+    enc_len = url_component_encoded_length(name);
+
+    if (base_len == 1 && base[0] == '/') {
+        if (enc_len + 2 > out_size)
+            return VFS_BAD_PATH;
+
+        out[0] = '/';
+        out_len = 1;
+    } else {
+        if (base_len + enc_len + 3 > out_size)
+            return VFS_BAD_PATH;
+
+        memcpy(out, base, base_len);
+        out_len = base_len;
+        out[out_len++] = '/';
+    }
+
+    if (url_encode_component(name,
+                             out + out_len,
+                             out_size - out_len) != VFS_OK)
+        return VFS_BAD_PATH;
+
+    return VFS_OK;
+}
+
+static s4 join_rel_path(const char *base,
+                        const char *name,
+                        char *out,
+                        size_t out_size)
+{
+    size_t base_len;
     size_t name_len;
-    size_t needed;
+
+    if (base == NULL ||
+        name == NULL ||
+        out == NULL ||
+        out_size == 0)
+        return VFS_BAD_PATH;
 
     base_len = strlen(base);
     name_len = strlen(name);
 
-    if (strcmp(base, "/") == 0)
-        needed = 1 + name_len + 1;
-    else
-        needed = base_len + 1 + name_len + 1;
+    if (base_len == 0) {
+        if (name_len + 1 > out_size)
+            return VFS_BAD_PATH;
 
-    if (needed > out_size)
-        return -1;
-
-    if (strcmp(base, "/") == 0) {
-        out[0] = '/';
-
-        memcpy(out + 1,
-               name,
-               name_len + 1);
-    } else {
-        memcpy(out, base, base_len);
-
-        out[base_len] = '/';
-
-        memcpy(out + base_len + 1,
-               name,
-               name_len + 1);
+        memcpy(out, name, name_len + 1);
+        return VFS_OK;
     }
 
-    return 0;
+    if (base_len + name_len + 2 > out_size)
+        return VFS_BAD_PATH;
+
+    memcpy(out, base, base_len);
+    out[base_len] = '/';
+    memcpy(out + base_len + 1, name, name_len + 1);
+
+    return VFS_OK;
 }
 
 /* ------------------------------------------------------------------ */
-/* recursive directory scan                                            */
+/* scanning                                                            */
 /* ------------------------------------------------------------------ */
 
 static s4 scan_directory(struct vfs *vfs,
                          const char *disk_dir,
-                         const char *url_dir)
+                         const char *rel_dir,
+                         const char *url_dir,
+                         s4 depth)
 {
     DIR *dir;
     struct dirent *de;
 
     char disk_path[PATH_MAX];
+    char rel_path[PATH_MAX];
     char url_path[PATH_MAX];
 
     struct stat st;
+
+    if (depth > VFS_MAX_SCAN_DEPTH)
+        return VFS_ERROR;
 
     dir = opendir(disk_dir);
 
     if (dir == NULL) {
         fprintf(stderr,
-                "civet: cannot read directory '%s': %s\n",
+                "civet: cannot read '%s': %s\n",
                 disk_dir,
                 strerror(errno));
         return VFS_ERROR;
     }
 
+    errno = 0;
+
     while ((de = readdir(dir)) != NULL) {
 
-        /*
-         * Never recurse into "." or "..".
-         */
         if (strcmp(de->d_name, ".") == 0 ||
             strcmp(de->d_name, "..") == 0)
             continue;
 
-        /*
-         * Construct paths from filesystem names discovered by us,
-         * never from HTTP input.
-         */
-        if (join_disk_path(disk_dir,
-                           de->d_name,
-                           disk_path,
-                           sizeof(disk_path)) != 0) {
-            fprintf(stderr,
-                    "civet: path too long: '%s/%s'\n",
-                    disk_dir,
-                    de->d_name);
-            closedir(dir);
-            return VFS_ERROR;
-        }
+        if (join_rel_path(rel_dir,
+                          de->d_name,
+                          rel_path,
+                          sizeof(rel_path)) != VFS_OK)
+            continue;
 
         if (join_url_path(url_dir,
                           de->d_name,
                           url_path,
-                          sizeof(url_path)) != 0) {
-            fprintf(stderr,
-                    "civet: URL path too long: '%s/%s'\n",
-                    url_dir,
-                    de->d_name);
-            closedir(dir);
-            return VFS_ERROR;
-        }
+                          sizeof(url_path)) != VFS_OK)
+            continue;
 
-        /*
-         * Use lstat(), not stat().
-         *
-         * This means a symlink is identified as a symlink instead of
-         * following it somewhere outside our configured root.
-         */
+        if (snprintf(disk_path,
+                     sizeof(disk_path),
+                     "%s/%s",
+                     disk_dir,
+                     de->d_name) < 0)
+            continue;
+
         if (lstat(disk_path, &st) != 0) {
+            if (errno == ENOENT)
+                continue;
+
             fprintf(stderr,
                     "civet: cannot stat '%s': %s\n",
                     disk_path,
@@ -247,17 +321,14 @@ static s4 scan_directory(struct vfs *vfs,
             continue;
         }
 
-        /*
-         * Deliberately ignore symlinks and all special files.
-         */
         if (!S_ISREG(st.st_mode) &&
             !S_ISDIR(st.st_mode))
             continue;
 
-        if (add_entry(vfs,
-                      url_path,
-                      disk_path,
-                      &st) != VFS_OK) {
+        if (vfs_add(vfs,
+                    url_path,
+                    rel_path,
+                    &st) != VFS_OK) {
             closedir(dir);
             return VFS_ERROR;
         }
@@ -265,99 +336,83 @@ static s4 scan_directory(struct vfs *vfs,
         if (S_ISDIR(st.st_mode)) {
             if (scan_directory(vfs,
                                disk_path,
-                               url_path) != VFS_OK) {
+                               rel_path,
+                               url_path,
+                               depth + 1) != VFS_OK) {
                 closedir(dir);
                 return VFS_ERROR;
             }
         }
     }
 
-    closedir(dir);
+    if (errno != 0) {
+        fprintf(stderr,
+                "civet: error reading '%s': %s\n",
+                disk_dir,
+                strerror(errno));
+        closedir(dir);
+        return VFS_ERROR;
+    }
 
+    closedir(dir);
     return VFS_OK;
 }
 
 /* ------------------------------------------------------------------ */
-/* public initialization                                               */
+/* initialization                                                      */
 /* ------------------------------------------------------------------ */
 
 s4 vfs_init(struct vfs *vfs, const char *root)
 {
     struct stat st;
-    char normalized_root[PATH_MAX];
+    char real_root[PATH_MAX];
 
     if (vfs == NULL || root == NULL)
         return VFS_ERROR;
 
     memset(vfs, 0, sizeof(*vfs));
 
-    /*
-     * cfg->root has already gone through realpath() in main.c.
-     *
-     * Still verify it here because vfs_init() should have a clean
-     * contract of its own.
-     */
-    if (realpath(root,
-                 normalized_root) == NULL) {
+    if (realpath(root, real_root) == NULL) {
         fprintf(stderr,
-                "civet: cannot resolve VFS root '%s': %s\n",
+                "civet: cannot resolve '%s': %s\n",
                 root,
                 strerror(errno));
         return VFS_ERROR;
     }
 
-    if (stat(normalized_root, &st) != 0) {
-        fprintf(stderr,
-                "civet: cannot stat VFS root '%s': %s\n",
-                normalized_root,
-                strerror(errno));
-        return VFS_ERROR;
-    }
-
-    if (!S_ISDIR(st.st_mode)) {
+    if (stat(real_root, &st) != 0 ||
+        !S_ISDIR(st.st_mode)) {
         fprintf(stderr,
                 "civet: VFS root is not a directory: '%s'\n",
-                normalized_root);
+                real_root);
         return VFS_ERROR;
     }
 
-    if (strlen(normalized_root) >= sizeof(vfs->root)) {
-        fprintf(stderr,
-                "civet: VFS root path is too long\n");
+    if (strlen(real_root) >= sizeof(vfs->root))
         return VFS_ERROR;
-    }
 
-    strcpy(vfs->root, normalized_root);
+    strcpy(vfs->root, real_root);
 
-    /*
-     * The virtual root itself represents the configured root
-     * directory.
-     */
-    if (add_entry(vfs,
-                  "/",
-                  vfs->root,
-                  &st) != VFS_OK) {
+    if (vfs_add(vfs, "/", "", &st) != VFS_OK) {
         vfs_destroy(vfs);
         return VFS_ERROR;
     }
 
     if (scan_directory(vfs,
                        vfs->root,
-                       "/") != VFS_OK) {
+                       "",
+                       "/",
+                       0) != VFS_OK) {
         vfs_destroy(vfs);
         return VFS_ERROR;
     }
 
     fprintf(stderr,
-            "civet: indexed %lu filesystem entries\n",
+            "civet: indexed %lu entries\n",
             (unsigned long)vfs->entry_count);
 
     return VFS_OK;
 }
-
-/* ------------------------------------------------------------------ */
-/* destruction                                                         */
-/* ------------------------------------------------------------------ */
 
 void vfs_destroy(struct vfs *vfs)
 {
@@ -371,112 +426,78 @@ void vfs_destroy(struct vfs *vfs)
 
     while (entry != NULL) {
         next = entry->next;
-
-        free(entry->url_path);
-        free(entry->disk_path);
         free(entry);
-
         entry = next;
     }
 
     vfs->entries = NULL;
     vfs->entry_count = 0;
+    vfs->root[0] = '\0';
 }
 
 /* ------------------------------------------------------------------ */
-/* URL path normalization                                               */
+/* normalization                                                       */
 /* ------------------------------------------------------------------ */
 
 static s4 hex_value(char c)
 {
     if (c >= '0' && c <= '9')
-        return (s4)(c - '0');
+        return c - '0';
 
     if (c >= 'a' && c <= 'f')
-        return (s4)(c - 'a' + 10);
+        return c - 'a' + 10;
 
     if (c >= 'A' && c <= 'F')
-        return (s4)(c - 'A' + 10);
+        return c - 'A' + 10;
 
     return -1;
 }
 
-/*
- * Decode the path portion of an HTTP request-target.
- *
- * The query string is not part of the filesystem path.
- *
- * Percent decoding is performed exactly once.
- */
-static s4 decode_request_path(const char *input,
-                              char *output,
-                              size_t output_size)
+static s4 decode_component(const char *input,
+                           size_t len,
+                           char *out,
+                           size_t out_size)
 {
-    const char *p;
-    size_t out_len;
+    size_t i;
+    size_t n;
     s4 hi;
     s4 lo;
-    unsigned char value;
+    unsigned char c;
 
-    if (input == NULL ||
-        output == NULL ||
-        output_size == 0)
-        return VFS_BAD_PATH;
+    n = 0;
 
-    if (input[0] != '/')
-        return VFS_BAD_PATH;
+    for (i = 0; i < len; i++) {
 
-    p = input;
-    out_len = 0;
-
-    while (*p != '\0' && *p != '?') {
-
-        if (out_len + 1 >= output_size)
-            return VFS_BAD_PATH;
-
-        if (*p != '%') {
-            value = (unsigned char)*p;
-            p++;
-        } else {
-            /*
-             * '%' must be followed by exactly two hexadecimal digits.
-             */
-            if (p[1] == '\0' ||
-                p[2] == '\0' ||
-                p[1] == '?' ||
-                p[2] == '?')
+        if (input[i] == '%') {
+            if (i + 2 >= len)
                 return VFS_BAD_PATH;
 
-            hi = hex_value(p[1]);
-            lo = hex_value(p[2]);
+            hi = hex_value(input[i + 1]);
+            lo = hex_value(input[i + 2]);
 
             if (hi < 0 || lo < 0)
                 return VFS_BAD_PATH;
 
-            value = (unsigned char)((hi << 4) | lo);
-
-            p += 3;
+            c = (unsigned char)((hi << 4) | lo);
+            i += 2;
+        } else {
+            c = (unsigned char)input[i];
         }
 
-        /*
-         * NUL can never be part of a POSIX pathname and must never
-         * reach filesystem functions.
-         */
-        if (value == 0)
+        if (c == 0 ||
+            c == '/' ||
+            c == '\\' ||
+            c < 0x20 ||
+            c == 0x7f)
             return VFS_BAD_PATH;
 
-        /*
-         * Reject backslash so the virtual path model does not depend
-         * on platform-specific path semantics.
-         */
-        if (value == '\\')
+        if (n + 1 >= out_size)
             return VFS_BAD_PATH;
 
-        output[out_len++] = (char)value;
+        out[n++] = (char)c;
     }
 
-    output[out_len] = '\0';
-
+    out[n] = '\0';
     return VFS_OK;
 }
 
@@ -484,101 +505,83 @@ s4 vfs_normalize_path(const char *input,
                       char *output,
                       size_t output_size)
 {
-    char decoded[PATH_MAX];
+    size_t input_len;
+    size_t component_len;
+    size_t out_len;
 
     const char *p;
-    const char *component_start;
+    const char *start;
 
-    size_t out_len;
-    size_t component_len;
+    char decoded[PATH_MAX];
+    char encoded[PATH_MAX];
 
-    /*
-     * Decode before checking for "..".
-     *
-     * This makes all of these equivalent security failures:
-     *
-     *     /../foo
-     *     /%2e%2e/foo
-     *     /.%2e/foo
-     *     /%2E%2E/foo
-     */
-    if (decode_request_path(input,
-                            decoded,
-                            sizeof(decoded)) != VFS_OK)
+    if (input == NULL ||
+        output == NULL ||
+        output_size < 2 ||
+        input[0] != '/')
         return VFS_BAD_PATH;
 
-    if (decoded[0] != '/')
-        return VFS_BAD_PATH;
+    input_len = 0;
 
-    if (output == NULL ||
-        output_size < 2)
-        return VFS_BAD_PATH;
+    while (input[input_len] != '\0' &&
+           input[input_len] != '?') {
+
+        if (input_len >= PATH_MAX - 1)
+            return VFS_BAD_PATH;
+
+        input_len++;
+    }
 
     output[0] = '/';
     out_len = 1;
 
-    p = decoded + 1;
+    p = input + 1;
 
-    while (*p != '\0') {
+    while ((size_t)(p - input) < input_len) {
 
-        /*
-         * Collapse repeated '/' characters.
-         */
-        while (*p == '/')
-            p++;
-
-        if (*p == '\0')
-            break;
-
-        component_start = p;
-
-        while (*p != '/' && *p != '\0')
-            p++;
-
-        component_len = (size_t)(p - component_start);
-
-        /*
-         * "." has no effect.
-         */
-        if (component_len == 1 &&
-            component_start[0] == '.')
-            continue;
-
-        /*
-         * Reject ".." completely rather than allowing it to modify
-         * the virtual path stack.
-         */
-        if (component_len == 2 &&
-            component_start[0] == '.' &&
-            component_start[1] == '.')
-            return VFS_BAD_PATH;
-
-        /*
-         * Add separator before every component except the first.
-         */
-        if (out_len > 1) {
+        if (*p == '/') {
             if (out_len + 1 >= output_size)
                 return VFS_BAD_PATH;
 
             output[out_len++] = '/';
+            p++;
+            continue;
         }
 
-        if (out_len + component_len >= output_size)
+        start = p;
+
+        while ((size_t)(p - input) < input_len &&
+               *p != '/')
+            p++;
+
+        component_len = (size_t)(p - start);
+
+        if (decode_component(start,
+                             component_len,
+                             decoded,
+                             sizeof(decoded)) != VFS_OK)
+            return VFS_BAD_PATH;
+
+        if (strcmp(decoded, ".") == 0 ||
+            strcmp(decoded, "..") == 0)
+            return VFS_BAD_PATH;
+
+        if (url_encode_component(decoded,
+                                 encoded,
+                                 sizeof(encoded)) != VFS_OK)
+            return VFS_BAD_PATH;
+
+        component_len = strlen(encoded);
+
+        if (component_len >
+            output_size - out_len - 1)
             return VFS_BAD_PATH;
 
         memcpy(output + out_len,
-               component_start,
+               encoded,
                component_len);
 
         out_len += component_len;
-    }
-
-    /*
-     * Empty normalized path means root.
-     */
-    if (out_len == 1) {
-        output[1] = '\0';
-        return VFS_OK;
     }
 
     output[out_len] = '\0';
@@ -587,11 +590,12 @@ s4 vfs_normalize_path(const char *input,
 }
 
 /* ------------------------------------------------------------------ */
-/* lookup                                                               */
+/* lookup                                                              */
 /* ------------------------------------------------------------------ */
 
 const struct vfs_entry *
-vfs_lookup(const struct vfs *vfs, const char *url_path)
+vfs_lookup(const struct vfs *vfs,
+           const char *url_path)
 {
     const struct vfs_entry *entry;
 
@@ -610,10 +614,10 @@ vfs_lookup(const struct vfs *vfs, const char *url_path)
 }
 
 /* ------------------------------------------------------------------ */
-/* virtual filesystem tree                                              */
+/* dump                                                                */
 /* ------------------------------------------------------------------ */
 
-static int vfs_entry_compare(const void *a, const void *b)
+static int entry_compare(const void *a, const void *b)
 {
     const struct vfs_entry *ea;
     const struct vfs_entry *eb;
@@ -624,114 +628,45 @@ static int vfs_entry_compare(const void *a, const void *b)
     return strcmp(ea->url_path, eb->url_path);
 }
 
-static s4 vfs_path_depth(const char *path)
-{
-    s4 depth;
-
-    depth = 0;
-
-    while (*path != '\0') {
-        if (*path == '/')
-            depth++;
-
-        path++;
-    }
-
-    if (depth > 0)
-        depth--;
-
-    return depth;
-}
-
-static void vfs_print_indent(s4 depth)
-{
-    s4 i;
-
-    for (i = 0; i < depth; i++)
-        fputs("    ", stderr);
-}
-
 void vfs_dump(const struct vfs *vfs)
 {
-    struct vfs_entry **items;
     const struct vfs_entry *entry;
+    struct vfs_entry **items;
+
     size_t i;
-    size_t count;
-    s4 depth;
-    s4 directories;
-    s4 files;
+    size_t n;
 
-    if (vfs == NULL)
+    if (vfs == NULL || vfs->entry_count == 0)
         return;
-
-    if (vfs->entry_count == 0) {
-        fprintf(stderr,
-                "civet: virtual filesystem is empty\n");
-        return;
-    }
 
     items = (struct vfs_entry **)malloc(
         vfs->entry_count * sizeof(*items));
 
-    if (items == NULL) {
-        fprintf(stderr,
-                "civet: cannot display virtual filesystem: "
-                "out of memory\n");
+    if (items == NULL)
         return;
-    }
 
-    count = 0;
-    directories = 0;
-    files = 0;
+    n = 0;
 
     for (entry = vfs->entries;
          entry != NULL;
-         entry = entry->next) {
-
-        items[count] = (struct vfs_entry *)entry;
-        count++;
-
-        if (entry->type == VFS_DIRECTORY)
-            directories++;
-        else if (entry->type == VFS_FILE)
-            files++;
-    }
+         entry = entry->next)
+        items[n++] = (struct vfs_entry *)entry;
 
     qsort(items,
-          count,
+          n,
           sizeof(*items),
-          vfs_entry_compare);
+          entry_compare);
 
-    fprintf(stderr,
-            "civet: virtual filesystem:\n");
+    fprintf(stderr, "civet: virtual filesystem:\n");
 
-    fprintf(stderr, "/\n");
-
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < n; i++) {
         entry = items[i];
 
-        if (strcmp(entry->url_path, "/") == 0)
-            continue;
-
-        depth = vfs_path_depth(entry->url_path);
-
-        vfs_print_indent(depth);
-
-        if (entry->type == VFS_DIRECTORY) {
-            fprintf(stderr,
-                    "|-- %s/\n",
-                    strrchr(entry->url_path, '/') + 1);
-        } else if (entry->type == VFS_FILE) {
-            fprintf(stderr,
-                    "|-- %s\n",
-                    strrchr(entry->url_path, '/') + 1);
-        }
+        fprintf(stderr,
+                "  %s%s\n",
+                entry->url_path,
+                entry->type == VFS_DIRECTORY ? "/" : "");
     }
-
-    fprintf(stderr,
-            "civet: %ld directories, %ld files\n",
-            (long)directories,
-            (long)files);
 
     free(items);
 }

@@ -20,6 +20,14 @@ Install:
 make install
 ```
 
+## Debug build:
+
+```sh
+make DEBUG=1
+```
+
+This enables runtime debug logging.
+
 ## Quick start
 
 Serve `./test` on `127.0.0.1:8080` and cache `index.html` and `other_page.html` in memory:
@@ -73,39 +81,12 @@ Options:
   -v, --version     show version and exit
 ```
 
-## Virtual filesystem and security
-
-Civet uses an in-memory virtual filesystem (VFS) as a boundary between HTTP request paths and the real filesystem.
-
-At startup, Civet scans the configured document root and builds an index of the files and directories that are actually available to the server. HTTP requests are then resolved against this virtual namespace rather than directly concatenated with the document-root path.
-
-This design helps prevent common path traversal problems such as:
-
-```text
-/../../etc/passwd
-```
-
-and encoded variants such as:
-
-```text
-/%2e%2e/%2e%2e/etc/passwd
-```
-
-Request paths are normalized before lookup. Percent-encoded paths are decoded, `..` components are rejected, and the final path must exist in the VFS.
-
-The VFS also allows Civet to ignore symbolic links and unsupported filesystem objects during indexing. This keeps the server's HTTP namespace explicit instead of allowing arbitrary filesystem paths to become reachable through URL manipulation.
-
-The VFS is therefore both a performance-oriented index and an important security boundary.
-
-**Security note:** Civet is intentionally a small static file server, not a hardened production web server. Run it with the minimum filesystem permissions required, avoid serving sensitive directories, and review the configuration before binding it to a public network interface.
-
 ## Features
 
 * Small POSIX HTTP server
 * HTTP/1.0 and HTTP/1.1 request parsing
 * `GET` and `HEAD` support
 * In-memory virtual filesystem index
-* Path normalization and traversal protection
 * Optional in-memory file cache
 * Directory `index.html` support
 * MIME type detection
