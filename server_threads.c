@@ -25,6 +25,9 @@ static void debug_log(const char *msg)
 #define DBG0(msg) do { } while (0)
 #endif
 
+static pthread_mutex_t thread_mutex = PTHREAD_MUTEX_INITIALIZER;
+static s4 thread_count = 0;
+
 static s4 send_all(int fd, const char *buf, size_t len)
 {
     ssize_t n;
@@ -547,7 +550,6 @@ static void *server_thread_main(void *arg)
     struct vfs *vfs;
     struct vfs_server *vfs_server;
     struct cache *cache;
-    s4 rc;
 
     DBG0("server_thread_main: ENTER");
 
@@ -569,14 +571,18 @@ static void *server_thread_main(void *arg)
 
     DBG0("server_thread_main: BEFORE handle_client");
 
-    rc = handle_client(client_fd,
-                       vfs,
-                       vfs_server,
-                       cache);
+    handle_client(client_fd,
+                  vfs,
+                  vfs_server,
+                  cache);
 
     DBG0("server_thread_main: AFTER handle_client");
 
     close(client_fd);
+
+    pthread_mutex_lock(&thread_mutex);
+    thread_count--;
+    pthread_mutex_unlock(&thread_mutex);
 
     DBG0("server_thread_main: BEFORE free");
 
@@ -599,12 +605,28 @@ s4 server_thread_start(int client_fd,
 
     DBG0("server_thread_start: ENTER");
 
+    pthread_mutex_lock(&thread_mutex);
+
+    if (thread_count >= SERVER_MAX_THREADS) {
+        pthread_mutex_unlock(&thread_mutex);
+        DBG0("server_thread_start: thread limit reached");
+        return -1;
+    }
+
+    thread_count++;
+
+    pthread_mutex_unlock(&thread_mutex);
+
     args = (struct server_thread_args *)malloc(sizeof(*args));
 
     DBG0("server_thread_start: AFTER malloc");
 
-    if (args == NULL)
+    if (args == NULL) {
+        pthread_mutex_lock(&thread_mutex);
+        thread_count--;
+        pthread_mutex_unlock(&thread_mutex);
         return -1;
+    }
 
     args->client_fd = client_fd;
     args->vfs = vfs;
@@ -618,6 +640,10 @@ s4 server_thread_start(int client_fd,
     DBG0("server_thread_start: AFTER pthread_attr_init");
 
     if (rc != 0) {
+        pthread_mutex_lock(&thread_mutex);
+        thread_count--;
+        pthread_mutex_unlock(&thread_mutex);
+
         free(args);
         return -1;
     }
@@ -629,6 +655,11 @@ s4 server_thread_start(int client_fd,
 
     if (rc != 0) {
         pthread_attr_destroy(&attr);
+
+        pthread_mutex_lock(&thread_mutex);
+        thread_count--;
+        pthread_mutex_unlock(&thread_mutex);
+
         free(args);
         return -1;
     }
@@ -645,6 +676,10 @@ s4 server_thread_start(int client_fd,
     pthread_attr_destroy(&attr);
 
     if (rc != 0) {
+        pthread_mutex_lock(&thread_mutex);
+        thread_count--;
+        pthread_mutex_unlock(&thread_mutex);
+
         free(args);
         return -1;
     }

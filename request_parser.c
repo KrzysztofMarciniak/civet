@@ -9,7 +9,7 @@
 /* small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-static s4 is_space(u1 c)
+static s4 is_ows(u1 c)
 {
     return c == (u1)' ' || c == (u1)'\t';
 }
@@ -22,104 +22,97 @@ static s4 ascii_lower(u1 c)
     return (s4)c;
 }
 
-/*
- * HTTP header field names are ASCII tokens. Comparison is therefore
- * deliberately ASCII-only rather than depending on the current locale.
- */
-static s4 name_equal(const char *a, const char *b)
+static s4 name_equal(const char *a,
+                     size_t a_len,
+                     const char *b)
 {
+    size_t i;
     u1 ca;
     u1 cb;
 
-    while (*a != '\0' && *b != '\0') {
-        ca = (u1)*a;
-        cb = (u1)*b;
+    if (a == NULL || b == NULL)
+        return 0;
+
+    for (i = 0; i < a_len; i++) {
+        if (b[i] == '\0')
+            return 0;
+
+        ca = (u1)a[i];
+        cb = (u1)b[i];
 
         if (ascii_lower(ca) != ascii_lower(cb))
             return 0;
-
-        a++;
-        b++;
     }
 
-    return *a == '\0' && *b == '\0';
-}
-
-static s4 is_crlf_at(const char *buf, size_t len, size_t p)
-{
-    if (p + 1 >= len)
-        return 0;
-
-    return (u1)buf[p] == (u1)'\r' &&
-           (u1)buf[p + 1] == (u1)'\n';
+    return b[a_len] == '\0';
 }
 
 /*
  * Find CRLF starting at `start`.
  *
- * Returns 1 when found and writes its position to *end.
- * Returns 0 when the line is not yet complete.
+ * Returns:
+ *   1  CRLF found
+ *   0  incomplete
+ *  -1  malformed bare CR/LF found
  */
-static s4 find_crlf(const char *buf, size_t len,
-                    size_t start, size_t *end)
+static s4 find_crlf(const char *buf,
+                    size_t len,
+                    size_t start,
+                    size_t *end)
 {
     size_t p;
 
-    for (p = start; p + 1 < len; p++) {
-        if ((u1)buf[p] == (u1)'\r' &&
-            (u1)buf[p + 1] == (u1)'\n') {
+    for (p = start; p < len; p++) {
+        if ((u1)buf[p] == (u1)'\r') {
+            if (p + 1 >= len)
+                return 0;
+
+            if ((u1)buf[p + 1] != (u1)'\n')
+                return -1;
+
             *end = p;
             return 1;
         }
 
-        /*
-         * Bare CR or LF is never a valid line ending. If either is
-         * encountered before CRLF, the request is malformed rather
-         * than merely incomplete.
-         */
-        if ((u1)buf[p] == (u1)'\r' ||
-            (u1)buf[p] == (u1)'\n') {
+        if ((u1)buf[p] == (u1)'\n')
             return -1;
-        }
     }
 
     return 0;
 }
 
 /*
- * Copy [start,end) into dst and append NUL.
+ * Validate origin-form percent escapes.
+ *
+ * '%' must always be followed by two hexadecimal digits.
  */
-static s4 copy_bytes(char *dst, size_t dst_size,
-                     const char *buf, size_t start, size_t end)
+static s4 valid_percent_encoding(const char *buf,
+                                 size_t start,
+                                 size_t end)
 {
-    size_t n;
+    size_t p;
 
-    if (end < start)
-        return -1;
+    for (p = start; p < end; p++) {
+        if ((u1)buf[p] != (u1)'%')
+            continue;
 
-    n = end - start;
+        if (p + 2 >= end)
+            return 0;
 
-    if (n + 1 > dst_size)
-        return -1;
+        if (!ac_is_hex((u1)buf[p + 1]) ||
+            !ac_is_hex((u1)buf[p + 2]))
+            return 0;
 
-    if (n != 0)
-        memcpy(dst, buf + start, n);
+        p += 2;
+    }
 
-    dst[n] = '\0';
-    return 0;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
 /* request line                                                        */
 /* ------------------------------------------------------------------ */
 
-/*
- * Parse:
- *
- *     METHOD SP request-target SP HTTP-version CRLF
- *
- * No other whitespace is accepted in the request line.
- */
 static s4 parse_request_line(const char *buf,
                              size_t start,
                              size_t end,
@@ -138,7 +131,7 @@ static s4 parse_request_line(const char *buf,
     p = start;
 
     /*
-     * Method.
+     * METHOD
      */
     while (p < end && (u1)buf[p] != (u1)' ')
         p++;
@@ -151,17 +144,11 @@ static s4 parse_request_line(const char *buf,
     if (method_end == method_start)
         return REQUEST_PARSE_BAD;
 
-    /*
-     * Every method character must be tchar.
-     */
     for (i = method_start; i < method_end; i++) {
         if (!ac_is_token((u1)buf[i]))
             return REQUEST_PARSE_BAD;
     }
 
-    /*
-     * We intentionally only implement GET and HEAD.
-     */
     n = method_end - method_start;
 
     if (n == 3 &&
@@ -180,9 +167,12 @@ static s4 parse_request_line(const char *buf,
     }
 
     /*
-     * Exactly one SP between method and target.
+     * Exactly one SP.
      */
     p++;
+
+    if (p >= end || (u1)buf[p] == (u1)' ')
+        return REQUEST_PARSE_BAD;
 
     target_start = p;
 
@@ -198,8 +188,13 @@ static s4 parse_request_line(const char *buf,
         return REQUEST_PARSE_BAD;
 
     /*
-     * Request-target must contain URI-allowed bytes according to our
-     * table. This also means NUL and all other control bytes fail.
+     * Origin-form only.
+     */
+    if (buf[target_start] != '/')
+        return REQUEST_PARSE_BAD;
+
+    /*
+     * Validate request-target characters.
      */
     for (i = target_start; i < target_end; i++) {
         if (!ac_is_uri((u1)buf[i]))
@@ -207,44 +202,52 @@ static s4 parse_request_line(const char *buf,
     }
 
     /*
-     * This server serves origin-form targets:
-     *
-     *     /index.html
-     *     /foo/bar?x=1
-     *
-     * Absolute-form is useful for proxies but is unnecessary here.
+     * '%' is permitted in URI syntax but must form a valid
+     * percent-encoded triplet.
      */
-    if (buf[target_start] != '/')
+    if (!valid_percent_encoding(buf,
+                                target_start,
+                                target_end))
         return REQUEST_PARSE_BAD;
 
-    if (copy_bytes(req->target, sizeof(req->target),
-                   buf, target_start, target_end) != 0)
+    if (target_end - target_start + 1 >
+        sizeof(req->target))
         return REQUEST_PARSE_TOO_LARGE;
 
+    memcpy(req->target,
+           buf + target_start,
+           target_end - target_start);
+
+    req->target[target_end - target_start] = '\0';
+
     /*
-     * Exactly one SP between target and HTTP-version.
+     * Exactly one SP before HTTP-version.
      */
     p++;
 
+    if (p >= end || (u1)buf[p] == (u1)' ')
+        return REQUEST_PARSE_BAD;
+
     version_start = p;
 
+    /*
+     * There cannot be another SP in HTTP-version.
+     */
     while (p < end && (u1)buf[p] != (u1)' ')
         p++;
 
-    /*
-     * There must not be another space after HTTP-version.
-     *
-     * Since this is the request-line itself, the final byte before CRLF
-     * is the end of the version.
-     */
     if (p != end)
         return REQUEST_PARSE_BAD;
 
     if (end - version_start == 8 &&
-        memcmp(buf + version_start, "HTTP/1.0", 8) == 0) {
+        memcmp(buf + version_start,
+               "HTTP/1.0",
+               8) == 0) {
         req->version = REQUEST_HTTP_10;
     } else if (end - version_start == 8 &&
-               memcmp(buf + version_start, "HTTP/1.1", 8) == 0) {
+               memcmp(buf + version_start,
+                      "HTTP/1.1",
+                      8) == 0) {
         req->version = REQUEST_HTTP_11;
     } else {
         return REQUEST_PARSE_BAD;
@@ -257,49 +260,39 @@ static s4 parse_request_line(const char *buf,
 /* Content-Length                                                      */
 /* ------------------------------------------------------------------ */
 
-/*
- * Parse an unsigned decimal Content-Length.
- *
- * No signs, whitespace, hexadecimal, or other syntax are accepted.
- */
-static s4 parse_content_length(const char *value, u8 *out)
+static s4 parse_content_length(const char *value,
+                               size_t len,
+                               u8 *out)
 {
-    const unsigned char *p;
+    size_t p;
     u8 n;
     u1 digit;
+    u8 max_value;
 
-    if (value == NULL || *value == '\0')
+    if (value == NULL || out == NULL || len == 0)
         return -1;
 
-    p = (const unsigned char *)value;
     n = 0;
+    max_value = (u8)~(u8)0;
 
-    while (*p != '\0') {
-        if (!ac_is_digit(*p))
+    for (p = 0; p < len; p++) {
+        if (!ac_is_digit((u1)value[p]))
             return -1;
 
-        digit = (u1)(*p - (unsigned char)'0');
+        digit = (u1)(value[p] - '0');
 
-        /*
-         * Overflow test:
-         *
-         * n * 10 + digit <= U8_MAX
-         *
-         * U8_MAX is not available in the current lib.h, so use the
-         * maximum value representable by u8.
-         */
-        if (n > (u8)(~(u8)0) / (u8)10)
+        if (n > max_value / (u8)10)
             return -1;
 
-        if (n == (u8)(~(u8)0) / (u8)10 &&
-            (u8)digit > (u8)(~(u8)0) % (u8)10)
+        if (n == max_value / (u8)10 &&
+            (u8)digit > max_value % (u8)10)
             return -1;
 
         n = n * (u8)10 + (u8)digit;
-        p++;
     }
 
     *out = n;
+
     return 0;
 }
 
@@ -307,13 +300,6 @@ static s4 parse_content_length(const char *value, u8 *out)
 /* header parsing                                                      */
 /* ------------------------------------------------------------------ */
 
-/*
- * Parse one header line:
- *
- *     field-name ":" OWS field-value OWS
- *
- * `start` and `end` delimit the bytes before CRLF.
- */
 static s4 parse_header_line(const char *buf,
                             size_t start,
                             size_t end,
@@ -323,32 +309,40 @@ static s4 parse_header_line(const char *buf,
     size_t colon;
     size_t value_start;
     size_t value_end;
+    size_t name_len;
+    size_t value_len;
     struct request_header *h;
 
     if (start == end)
         return REQUEST_PARSE_OK;
 
     /*
-     * Leading whitespace would be obsolete line folding. Reject it
-     * rather than treating it as part of the previous header.
+     * Reject obs-fold / leading whitespace.
      */
-    if (is_space((u1)buf[start]))
+    if (is_ows((u1)buf[start]))
         return REQUEST_PARSE_BAD;
 
     colon = start;
 
-    while (colon < end && (u1)buf[colon] != (u1)':')
+    while (colon < end &&
+           (u1)buf[colon] != (u1)':')
         colon++;
 
     if (colon == end)
         return REQUEST_PARSE_BAD;
 
-    /*
-     * Field-name must be non-empty and entirely tchar.
-     */
     if (colon == start)
         return REQUEST_PARSE_BAD;
 
+    /*
+     * No whitespace is permitted before ':'.
+     */
+    if (is_ows((u1)buf[colon - 1]))
+        return REQUEST_PARSE_BAD;
+
+    /*
+     * Field-name = token.
+     */
     for (p = start; p < colon; p++) {
         if (!ac_is_token((u1)buf[p]))
             return REQUEST_PARSE_BAD;
@@ -357,19 +351,18 @@ static s4 parse_header_line(const char *buf,
     if (req->header_count >= REQUEST_MAX_HEADERS)
         return REQUEST_PARSE_TOO_LARGE;
 
-    h = &req->headers[req->header_count];
+    name_len = colon - start;
 
-    if (copy_bytes(h->name, sizeof(h->name),
-                   buf, start, colon) != 0)
+    if (name_len > REQUEST_MAX_HEADER_NAME)
         return REQUEST_PARSE_TOO_LARGE;
 
     /*
-     * Skip the colon and optional whitespace.
+     * Skip ':' and leading OWS.
      */
     value_start = colon + 1;
 
     while (value_start < end &&
-           is_space((u1)buf[value_start]))
+           is_ows((u1)buf[value_start]))
         value_start++;
 
     /*
@@ -378,56 +371,84 @@ static s4 parse_header_line(const char *buf,
     value_end = end;
 
     while (value_end > value_start &&
-           is_space((u1)buf[value_end - 1]))
+           is_ows((u1)buf[value_end - 1]))
         value_end--;
 
+    value_len = value_end - value_start;
+
+    if (value_len > REQUEST_MAX_HEADER_VALUE)
+        return REQUEST_PARSE_TOO_LARGE;
+
     /*
-     * Every remaining byte must be permitted in a field value.
+     * Field-value:
      *
-     * In particular this rejects:
-     *   NUL
-     *   bare CR/LF
-     *   other controls
-     *   DEL
+     *   HTAB
+     *   SP
+     *   VCHAR
+     *   obs-text
      *
-     * obs-text 0x80..0xFF is permitted by AC_VALUE.
+     * Reject all other control characters, including DEL and NUL.
      */
     for (p = value_start; p < value_end; p++) {
-        if (!ac_is_value((u1)buf[p]))
+        u1 c;
+
+        c = (u1)buf[p];
+
+        if (c == 0x7F)
+            return REQUEST_PARSE_BAD;
+
+        if (!ac_is_value(c))
             return REQUEST_PARSE_BAD;
     }
 
-    if (copy_bytes(h->value, sizeof(h->value),
-                   buf, value_start, value_end) != 0)
-        return REQUEST_PARSE_TOO_LARGE;
+    h = &req->headers[req->header_count];
+
+    h->name = buf + start;
+    h->name_len = name_len;
+
+    h->value = buf + value_start;
+    h->value_len = value_len;
 
     req->header_count++;
 
     /*
-     * Process headers whose semantics matter to the parser.
+     * Content-Length.
      */
-    if (name_equal(h->name, "Content-Length")) {
+    if (name_equal(h->name,
+                   h->name_len,
+                   "Content-Length")) {
         u8 value;
 
         /*
-         * Multiple Content-Length fields are deliberately rejected.
-         * That avoids having to implement the several equivalent-value
-         * cases and keeps request framing unambiguous.
+         * This server does not consume request bodies.
+         * Therefore a non-zero Content-Length is rejected.
          */
         if (req->has_content_length)
             return REQUEST_PARSE_BAD;
 
-        if (parse_content_length(h->value, &value) != 0)
+        if (parse_content_length(h->value,
+                                 h->value_len,
+                                 &value) != 0)
+            return REQUEST_PARSE_BAD;
+
+        if (value != (u8)0)
             return REQUEST_PARSE_BAD;
 
         req->has_content_length = 1;
         req->content_length = value;
-    } else if (name_equal(h->name, "Transfer-Encoding")) {
-        /*
-         * We do not implement HTTP message transfer codings.
-         * Rejecting the header entirely avoids request-smuggling
-         * ambiguity between this parser and the socket reader.
-         */
+    }
+
+    /*
+     * Transfer-Encoding is not implemented by Civet.
+     */
+    else if (name_equal(h->name,
+                        h->name_len,
+                        "Transfer-Encoding")) {
+        if (req->has_transfer_encoding)
+            return REQUEST_PARSE_BAD;
+
+        req->has_transfer_encoding = 1;
+
         return REQUEST_PARSE_BAD;
     }
 
@@ -439,7 +460,8 @@ static s4 parse_header_line(const char *buf,
 /* ------------------------------------------------------------------ */
 
 const struct request_header *
-request_header_get(const struct http_request *req, const char *name)
+request_header_get(const struct http_request *req,
+                   const char *name)
 {
     s4 i;
 
@@ -447,22 +469,29 @@ request_header_get(const struct http_request *req, const char *name)
         return NULL;
 
     for (i = 0; i < req->header_count; i++) {
-        if (name_equal(req->headers[i].name, name))
+        if (name_equal(req->headers[i].name,
+                       req->headers[i].name_len,
+                       name))
             return &req->headers[i];
     }
 
     return NULL;
 }
 
-s4 request_parse(const char *buf, size_t len,
-                 struct http_request *req, size_t *consumed)
+s4 request_parse(const char *buf,
+                 size_t len,
+                 struct http_request *req,
+                 size_t *consumed)
 {
     size_t p;
     size_t line_end;
+    size_t header_end;
     s4 r;
     const struct request_header *host;
 
-    if (buf == NULL || req == NULL || consumed == NULL)
+    if (buf == NULL ||
+        req == NULL ||
+        consumed == NULL)
         return REQUEST_PARSE_BAD;
 
     *consumed = 0;
@@ -471,17 +500,20 @@ s4 request_parse(const char *buf, size_t len,
         return REQUEST_PARSE_INCOMPLETE;
 
     /*
-     * A request header block larger than this is never accepted.
+     * Never silently truncate an oversized header buffer.
      */
     if (len > REQUEST_MAX_HEADER_BYTES)
-        len = REQUEST_MAX_HEADER_BYTES;
+        return REQUEST_PARSE_TOO_LARGE;
 
     memset(req, 0, sizeof(*req));
 
     /*
-     * ---------------- request line ----------------
+     * Request line.
      */
-    r = find_crlf(buf, len, 0, &line_end);
+    r = find_crlf(buf,
+                  len,
+                  0,
+                  &line_end);
 
     if (r == 0)
         return REQUEST_PARSE_INCOMPLETE;
@@ -489,7 +521,10 @@ s4 request_parse(const char *buf, size_t len,
     if (r < 0)
         return REQUEST_PARSE_BAD;
 
-    r = parse_request_line(buf, 0, line_end, req);
+    r = parse_request_line(buf,
+                           0,
+                           line_end,
+                           req);
 
     if (r != REQUEST_PARSE_OK)
         return r;
@@ -497,14 +532,13 @@ s4 request_parse(const char *buf, size_t len,
     p = line_end + 2;
 
     /*
-     * ---------------- headers ----------------
-     *
-     * The empty line CRLF terminates the header block.
+     * Header section.
      */
     for (;;) {
-        size_t header_end;
-
-        r = find_crlf(buf, len, p, &header_end);
+        r = find_crlf(buf,
+                      len,
+                      p,
+                      &header_end);
 
         if (r == 0)
             return REQUEST_PARSE_INCOMPLETE;
@@ -513,14 +547,17 @@ s4 request_parse(const char *buf, size_t len,
             return REQUEST_PARSE_BAD;
 
         /*
-         * Empty line: end of headers.
+         * Empty line terminates the header section.
          */
         if (header_end == p) {
             p += 2;
             break;
         }
 
-        r = parse_header_line(buf, p, header_end, req);
+        r = parse_header_line(buf,
+                              p,
+                              header_end,
+                              req);
 
         if (r != REQUEST_PARSE_OK)
             return r;
@@ -532,7 +569,7 @@ s4 request_parse(const char *buf, size_t len,
     }
 
     /*
-     * HTTP/1.1 requires Host.
+     * Host is mandatory for HTTP/1.1.
      */
     if (req->version == REQUEST_HTTP_11) {
         host = request_header_get(req, "Host");
@@ -541,12 +578,39 @@ s4 request_parse(const char *buf, size_t len,
             return REQUEST_PARSE_BAD;
 
         /*
-         * An empty Host value is not useful to this server.
+         * Keep Civet's policy that Host must not be empty.
          */
-        if (host->value[0] == '\0')
+        if (host->value_len == 0)
             return REQUEST_PARSE_BAD;
+
+        /*
+         * Host is a singleton field.
+         */
+        {
+            s4 i;
+            s4 host_count;
+
+            host_count = 0;
+
+            for (i = 0; i < req->header_count; i++) {
+                if (name_equal(req->headers[i].name,
+                               req->headers[i].name_len,
+                               "Host")) {
+                    host_count++;
+                }
+            }
+
+            if (host_count != 1)
+                return REQUEST_PARSE_BAD;
+        }
     }
 
+    /*
+     * No request body is supported.
+     *
+     * A Content-Length of zero is harmless; anything else was
+     * rejected while parsing the header.
+     */
     req->header_bytes = p;
     *consumed = p;
 
