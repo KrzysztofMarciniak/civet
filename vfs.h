@@ -15,6 +15,7 @@
 
 #define VFS_FILE 1
 #define VFS_DIRECTORY 2
+#define VFS_CGI 3
 
 #define VFS_OK 0
 #define VFS_NOT_FOUND 1
@@ -26,6 +27,7 @@ struct vfs_entry {
 	char* rel_path;
 
 	s4 type;
+	int is_cgi;
 
 	off_t size;
 	time_t mtime;
