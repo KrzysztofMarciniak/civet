@@ -4,15 +4,14 @@
 #include "vfs.h"
 
 struct vfs_server {
-    int root_fd;
+        int root_fd;
 };
 
-s4 vfs_server_init(struct vfs_server *server,
-                   const char *root);
+s4 vfs_server_init(struct vfs_server* server, const char* root);
 
-void vfs_server_destroy(struct vfs_server *server);
+void vfs_server_destroy(struct vfs_server* server);
 
-int vfs_server_open(const struct vfs_server *server,
-                    const struct vfs_entry *entry);
+int vfs_server_open(const struct vfs_server* server,
+                    const struct vfs_entry* entry);
 
 #endif

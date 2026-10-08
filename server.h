@@ -9,23 +9,23 @@
 #ifndef SERVER_H
 #define SERVER_H
 
+#include "cache.h"
 #include "lib.h"
 #include "vfs.h"
 #include "vfs_server.h"
-#include "cache.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 struct config {
-    const char *bind_addr;
-    u2          port;
+        const char* bind_addr;
+        u2 port;
 
-    const char *root_arg;
-    char        root[PATH_MAX];
+        const char* root_arg;
+        char root[PATH_MAX];
 
-    const char *cache_arg;
+        const char* cache_arg;
 };
 
 /*
@@ -34,9 +34,7 @@ struct config {
  * main() owns vfs, vfs_server, and cache.
  * server.c only uses them.
  */
-s4 server_run(const struct config *cfg,
-              struct vfs *vfs,
-              struct vfs_server *vfs_server,
-              struct cache *cache);
+s4 server_run(const struct config* cfg, struct vfs* vfs,
+              struct vfs_server* vfs_server, struct cache* cache);
 
 #endif

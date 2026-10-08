@@ -20,7 +20,7 @@ CFLAGS += -g
 endif
 
 SRCS = main.c allowed_chars.c port.c request_parser.c \
-       vfs.c vfs_server.c cache.c server.c server_threads.c
+       vfs.c vfs_server.c cache.c server.c server_threads.c help.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 
