@@ -7,12 +7,16 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "request_parser.h"
 
 #define SERVER_REQUEST_BUF 16384
 #define SERVER_FILE_BUF 8192
+#define SERVER_SOCKET_TIMEOUT_SECS 10
+#define SERVER_REQUEST_TIMEOUT_SECS 10
 
 #ifdef DEBUG
 static void debug_log(const char* msg) {
@@ -29,6 +33,28 @@ static void debug_log(const char* msg) {
 
 static pthread_mutex_t thread_mutex = PTHREAD_MUTEX_INITIALIZER;
 static s4 thread_count              = 0;
+
+static s4 set_socket_timeouts(int fd) {
+        struct timeval tv;
+
+        DBG0("set_socket_timeouts: ENTER");
+
+        tv.tv_sec  = SERVER_SOCKET_TIMEOUT_SECS;
+        tv.tv_usec = 0;
+
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+                DBG0("set_socket_timeouts: SO_RCVTIMEO failed");
+                return -1;
+        }
+
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+                DBG0("set_socket_timeouts: SO_SNDTIMEO failed");
+                return -1;
+        }
+
+        DBG0("set_socket_timeouts: EXIT");
+        return 0;
+}
 
 static s4 send_all(int fd, const char* buf, size_t len) {
         ssize_t n;
@@ -142,7 +168,7 @@ static s4 send_file_headers(int fd, const char* path, off_t size) {
 }
 
 static s4 send_cached_file(int fd, const struct cache_entry* entry,
-                           s4 head_only) {
+                          s4 head_only) {
         char buf[1024];
         int n;
 
@@ -359,6 +385,7 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
         size_t consumed;
         ssize_t n;
         s4 rc;
+        time_t deadline;
 
         DBG0("handle_client: ENTER");
 
@@ -370,16 +397,28 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
         }
 
         used = 0;
+        deadline = time(NULL) + SERVER_REQUEST_TIMEOUT_SECS;
 
         DBG0("handle_client: BEFORE recv");
 
         for (;;) {
+                if (time(NULL) >= deadline) {
+                        DBG0("handle_client: request deadline exceeded");
+                        free(req);
+                        return -1;
+                }
+
                 n = recv(fd, buf + used, sizeof(buf) - used, 0);
 
                 DBG0("handle_client: AFTER recv");
 
                 if (n < 0) {
                         if (errno == EINTR) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                DBG0("handle_client: recv timeout");
+                                free(req);
+                                return -1;
+                        }
 
                         DBG0("handle_client: recv failed");
                         free(req);
@@ -403,8 +442,8 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
                 if (rc == REQUEST_PARSE_INCOMPLETE) {
                         if (used == sizeof(buf)) {
                                 send_response(
-                                    fd, 431, "Request Header Fields Too Large",
-                                    "text/plain", "request too large\n");
+                                        fd, 431, "Request Header Fields Too Large",
+                                        "text/plain", "request too large\n");
                                 free(req);
                                 return -1;
                         }
@@ -467,6 +506,22 @@ static void* server_thread_main(void* arg) {
 
         cache = args->cache;
         DBG0("server_thread_main: cache assigned");
+
+        DBG0("server_thread_main: BEFORE set_socket_timeouts");
+
+        if (set_socket_timeouts(client_fd) < 0) {
+                DBG0("server_thread_main: set_socket_timeouts failed");
+                close(client_fd);
+
+                pthread_mutex_lock(&thread_mutex);
+                thread_count--;
+                pthread_mutex_unlock(&thread_mutex);
+
+                free(args);
+                return NULL;
+        }
+
+        DBG0("server_thread_main: AFTER set_socket_timeouts");
 
         DBG0("server_thread_main: BEFORE handle_client");
 
