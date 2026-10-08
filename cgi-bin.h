@@ -6,12 +6,12 @@
 #include "request_parser.h"
 #include "vfs.h"
 
-#define CGI_MAX_ENV_VARS   128
-#define CGI_MAX_ENV_BYTES  32768UL
-#define CGI_PREFIX     "/cgi-bin/"
-#define CGI_TIMEOUT    10
+#define CGI_MAX_ENV_VARS 128
+#define CGI_MAX_ENV_BYTES 32768UL
+#define CGI_PREFIX "/cgi-bin/"
+#define CGI_TIMEOUT 10
 #define CGI_MAX_OUTPUT (1024UL * 1024UL)
-#define CGI_MAX_BODY   65536UL
+#define CGI_MAX_BODY 65536UL
 
 struct cgi_request {
         const char* method;
