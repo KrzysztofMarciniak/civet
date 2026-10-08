@@ -17,11 +17,10 @@ DEBUG ?= 0
 ifeq ($(DEBUG),1)
 DEFS   += -DDEBUG
 CFLAGS += -g
-DEBUG_SRC = debug.c
 endif
 
 SRCS = main.c allowed_chars.c port.c request_parser.c \
-       vfs.c vfs_server.c cache.c server.c server_threads.c help.c $(DEBUG_SRC)
+       vfs.c vfs_server.c cache.c server.c server_threads.c help.c debug.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 
