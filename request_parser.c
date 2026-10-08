@@ -90,6 +90,22 @@ static s4 valid_percent_encoding(const char* buf, size_t start, size_t end) {
 /* request line                                                        */
 /* ------------------------------------------------------------------ */
 
+static s4 method_lookup(const char* s, size_t n) {
+        if (n == 3 && memcmp(s, "GET", 3) == 0) return REQUEST_METHOD_GET;
+
+        if (n == 4 && memcmp(s, "HEAD", 4) == 0) return REQUEST_METHOD_HEAD;
+
+        if (n == 4 && memcmp(s, "POST", 4) == 0) return REQUEST_METHOD_POST;
+
+        if (n == 3 && memcmp(s, "PUT", 3) == 0) return REQUEST_METHOD_PUT;
+
+        if (n == 5 && memcmp(s, "PATCH", 5) == 0) return REQUEST_METHOD_PATCH;
+
+        if (n == 6 && memcmp(s, "DELETE", 6) == 0) return REQUEST_METHOD_DELETE;
+
+        return 0;
+}
+
 static s4 parse_request_line(const char* buf, size_t start, size_t end,
                              struct http_request* req) {
         size_t p;
@@ -121,17 +137,9 @@ static s4 parse_request_line(const char* buf, size_t start, size_t end,
 
         n = method_end - method_start;
 
-        if (n == 3 && buf[method_start] == 'G' &&
-            buf[method_start + 1] == 'E' && buf[method_start + 2] == 'T') {
-                req->method = REQUEST_METHOD_GET;
-        } else if (n == 4 && buf[method_start] == 'H' &&
-                   buf[method_start + 1] == 'E' &&
-                   buf[method_start + 2] == 'A' &&
-                   buf[method_start + 3] == 'D') {
-                req->method = REQUEST_METHOD_HEAD;
-        } else {
-                return REQUEST_PARSE_BAD;
-        }
+        req->method = method_lookup(buf + method_start, n);
+
+        if (req->method == 0) return REQUEST_PARSE_BAD;
 
         /*
          * Exactly one SP.
@@ -343,15 +351,12 @@ static s4 parse_header_line(const char* buf, size_t start, size_t end,
                 u8 value;
 
                 /*
-                 * This server does not consume request bodies.
-                 * Therefore a non-zero Content-Length is rejected.
+                 * The caller reads the body (if any) after the headers.
                  */
                 if (req->has_content_length) return REQUEST_PARSE_BAD;
 
                 if (parse_content_length(h->value, h->value_len, &value) != 0)
                         return REQUEST_PARSE_BAD;
-
-                if (value != (u8)0) return REQUEST_PARSE_BAD;
 
                 req->has_content_length = 1;
                 req->content_length     = value;
@@ -490,11 +495,14 @@ s4 request_parse(const char* buf, size_t len, struct http_request* req,
         }
 
         /*
-         * No request body is supported.
-         *
-         * A Content-Length of zero is harmless; anything else was
-         * rejected while parsing the header.
+         * GET and HEAD carry no body here. Other methods may; the caller
+         * reads req->content_length bytes after *consumed.
          */
+        if ((req->method == REQUEST_METHOD_GET ||
+             req->method == REQUEST_METHOD_HEAD) &&
+            req->has_content_length && req->content_length != (u8)0)
+                return REQUEST_PARSE_BAD;
+
         req->header_bytes = p;
         *consumed         = p;
 

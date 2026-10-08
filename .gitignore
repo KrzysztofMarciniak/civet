@@ -24,3 +24,5 @@ core.*
 vgcore.*
 compile_commands.json
 .cache/
+
+example/website/cgi-bin/hello.bin

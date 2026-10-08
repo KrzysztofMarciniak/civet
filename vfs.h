@@ -6,8 +6,8 @@
 #include <sys/types.h>
 #include <time.h>
 
-#include "lib.h"
 #include "hash.h"
+#include "lib.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -23,25 +23,25 @@
 #define VFS_ERROR (-2)
 
 struct vfs_entry {
-	char* url_path;
-	char* rel_path;
+        char* url_path;
+        char* rel_path;
 
-	s4 type;
-	int is_cgi;
+        s4 type;
+        int is_cgi;
 
-	off_t size;
-	time_t mtime;
+        off_t size;
+        time_t mtime;
 
-	struct vfs_entry* next;
+        struct vfs_entry* next;
 };
 
 struct vfs {
-	char root[PATH_MAX];
+        char root[PATH_MAX];
 
-	struct vfs_entry* entries;
-	size_t entry_count;
+        struct vfs_entry* entries;
+        size_t entry_count;
 
-	struct hash_table* ht;
+        struct hash_table* ht;
 };
 
 s4 vfs_init(struct vfs* vfs, const char* root);

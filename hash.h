@@ -6,14 +6,14 @@
 struct vfs_entry;
 
 struct hash_entry {
-	struct vfs_entry* vfs_entry;
-	struct hash_entry* next;
+        struct vfs_entry* vfs_entry;
+        struct hash_entry* next;
 };
 
 struct hash_table {
-	struct hash_entry** buckets;
-	size_t capacity;
-	size_t size;
+        struct hash_entry** buckets;
+        size_t capacity;
+        size_t size;
 };
 
 struct hash_table* hash_table_create(size_t capacity);
