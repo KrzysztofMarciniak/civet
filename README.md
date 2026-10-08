@@ -22,11 +22,35 @@ make DEBUG=1
 ```
 
 ## Quick start
-
-Serve `./example` on `127.0.0.1:8080` and cache two files in memory:
+First make sure to compile the hello.bin:
 
 ```sh
-civet -r ./example/website -p 8080 -b 127.0.0.1 -c index.html,about.html
+cd example
+make
+cd ..
+```
+
+
+Serve `./example/website` on `127.0.0.1:8080` and cache two files in memory:
+
+```sh
+./civet -r ./example/website/ -c cgi-bin/hello.bin,index.html
+civet: indexed 9 entries
+civet: cached /cgi-bin/hello.bin (19112 bytes)
+civet: cached /index.html (943 bytes)
+civet: cache contains 2 files (20055 bytes, 256 MiB max)
+civet: virtual filesystem:
+  //
+  /about.html
+  /build.html
+  /cgi-bin/
+  /cgi-bin/hello.bin
+  /civet.html
+  /features.html
+  /index.html
+  /logo.png
+civet: serving /root/civet/example/website on http://127.0.0.1:8080/
+civet: listening on 127.0.0.1:8080
 ```
 
 * `-r` is the document root.
