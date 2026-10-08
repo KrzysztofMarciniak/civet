@@ -5,47 +5,36 @@
 </p>
 
 <p align="center">
-  Lean, small HTTP static file server written in C, with an in-memory virtual filesystem.
+  Lean HTTP server written in C89 for POSIX systems. Serves static files and CGI programs from an in-memory virtual filesystem.
 </p>
 
 ## Build
 
 ```sh
 make
-```
-
-Install:
-
-```sh
 make install
 ```
 
-## Debug build:
+For a build with runtime debug logging:
 
 ```sh
 make DEBUG=1
 ```
 
-This enables runtime debug logging.
-
 ## Quick start
 
-Serve `./test` on `127.0.0.1:8080` and cache `index.html` and `other_page.html` in memory:
+Serve `./example` on `127.0.0.1:8080` and cache two files in memory:
 
 ```sh
-civet -r ./test -p 8080 -b 127.0.0.1 -c index.html,other_page.html
+civet -r ./example/website -p 8080 -b 127.0.0.1 -c index.html,about.html
 ```
 
-The equivalent configuration uses:
+* `-r` is the document root.
+* `-p` is the port.
+* `-b` is the bind address.
+* `-c` is a list of files to load into RAM at startup. Cached files are served straight from memory.
 
-* `-r ./test` — document root
-* `-p 8080` — HTTP port
-* `-b 127.0.0.1` — bind address
-* `-c index.html,other_page.html` — preload selected files into memory
-
-Cached files are loaded into RAM when Civet starts and served directly from the cache.
-
-Example startup output:
+Startup output:
 
 ```text
 civet: indexed 3 filesystem entries
@@ -62,36 +51,44 @@ civet: listening on 127.0.0.1:8080
 civet: serving /path/to/test
 ```
 
-## Usage
-
-```text
-Usage: civet [options] [DIRECTORY]
-
-Serve the files in DIRECTORY over HTTP (GET and HEAD only).
-DIRECTORY defaults to the current directory.
-
-Options:
-  -r, --root DIR    directory to serve (same as DIRECTORY)
-  -p, --port N      TCP port to listen on     (default 8080)
-  -b, --bind ADDR   IPv4 address to listen on (default 127.0.0.1)
-                    use 0.0.0.0 to accept connections from anywhere
-  -c, --cache PATHS comma-separated files to cache in memory
-                    e.g. -c index.html,css/style.css
-  -h, --help        show this help and exit
-  -v, --version     show version and exit
-```
-
 ## Features
 
-* Small POSIX HTTP server
 * HTTP/1.0 and HTTP/1.1 request parsing
-* `GET` and `HEAD` support
+* Static files over `GET` and `HEAD`; other methods get `405`
+* CGI under `/cgi-bin/` with `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`
+* One detached thread per connection, with a configurable thread limit
+* `Expect: 100-continue` support
+* Socket and request timeouts
 * In-memory virtual filesystem index
 * Optional in-memory file cache
 * Directory `index.html` support
 * MIME type detection
 * Configurable bind address and port
-* Static file serving only
+
+## CGI
+
+Executables under `/cgi-bin/` are run as CGI programs. The request body is passed on stdin.
+
+Environment passed to the program:
+
+```text
+GATEWAY_INTERFACE  SERVER_SOFTWARE  SERVER_PROTOCOL
+SERVER_NAME        SERVER_PORT
+REQUEST_METHOD     SCRIPT_NAME      SCRIPT_FILENAME   QUERY_STRING
+CONTENT_TYPE       CONTENT_LENGTH
+REMOTE_ADDR        PATH
+HTTP_*             request headers (User-Agent -> HTTP_USER_AGENT, etc.)
+```
+
+`example/` has a small test CGI (`hello.c`) with a `Makefile`:
+
+```sh
+cd example
+make                          # builds website/cgi-bin/hello.bin
+civet -r ./website -p 8080    # open http://127.0.0.1:8080/cgi-bin/hello.bin
+```
+
+`make clean` removes the built binary.
 
 ## Requirements
 
@@ -99,32 +96,17 @@ Options:
 * C compiler
 * `make`
 
-
-
 ## Size
 
-(`version 0.0.1`)
-Built on x86-64 with musl:
+Version 0.0.3, x86-64, built with musl:
 
 ```text
-binary:     42,488 bytes (34,632 stripped)
-text:       24,416 bytes
-data:          960 bytes
+binary:     89,336 bytes
+text:       70,055 bytes
+data:        1,232 bytes
 bss:           456 bytes
-total:      25,832 bytes (25.2 KiB)
+total:      71,743 bytes (70.1 KiB)
 ```
-For comparison, [quark](https://git.suckless.org/quark/) built from commit
-5ad0df91757fbc577ffceeca633725e962da345d:
-
-```
-binary:     42K
-text:       29,154 bytes
-data:        6,000 bytes
-bss:         4,208 bytes
-total:      39,362 bytes (38.4 KiB)
-```
-
-Civet's text/data/bss footprint is ~34% smaller.
 
 ## License
 
