@@ -9,31 +9,18 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "debug.h"
 #include "server_threads.h"
 
 #define SERVER_BACKLOG 16
 #define EMFILE_BACKOFF_MS 100
-
-#ifdef DEBUG
-#define DBG(...)                                   \
-	do {                                       \
-		fprintf(stderr, "DEBUG server: "); \
-		fprintf(stderr, __VA_ARGS__);      \
-		fprintf(stderr, "\n");             \
-		fflush(stderr);                    \
-	} while (0)
-#else
-#define DBG(...) \
-	do {     \
-	} while (0)
-#endif
 
 static int make_listener(const struct config* cfg) {
 	int fd;
 	int yes;
 	struct sockaddr_in addr;
 
-	DBG("make_listener: begin");
+	debug_log("server", "make_listener: begin");
 
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -42,7 +29,7 @@ static int make_listener(const struct config* cfg) {
 		return -1;
 	}
 
-	DBG("make_listener: socket fd=%d", fd);
+	debug_log("server", "make_listener: socket fd=%d", fd);
 
 	yes = 1;
 
@@ -64,8 +51,8 @@ static int make_listener(const struct config* cfg) {
 		return -1;
 	}
 
-	DBG("make_listener: binding %s:%u", cfg->bind_addr,
-	    (unsigned)cfg->port);
+	debug_log("server", "make_listener: binding %s:%u", cfg->bind_addr,
+	          (unsigned)cfg->port);
 
 	if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
 		fprintf(stderr, "civet: bind %s:%u: %s\n", cfg->bind_addr,
@@ -74,7 +61,7 @@ static int make_listener(const struct config* cfg) {
 		return -1;
 	}
 
-	DBG("make_listener: bind successful");
+	debug_log("server", "make_listener: bind successful");
 
 	if (listen(fd, SERVER_BACKLOG) < 0) {
 		perror("civet: listen");
@@ -82,7 +69,7 @@ static int make_listener(const struct config* cfg) {
 		return -1;
 	}
 
-	DBG("make_listener: listen successful fd=%d", fd);
+	debug_log("server", "make_listener: listen successful fd=%d", fd);
 
 	return fd;
 }
@@ -102,20 +89,20 @@ s4 server_run(const struct config* cfg, struct vfs* vfs,
 	int client_fd;
 	s4 rc;
 
-	DBG("server_run: begin");
+	debug_log("server", "server_run: begin");
 
 	if (cfg == NULL || vfs == NULL || vfs_server == NULL || cache == NULL) {
-		DBG("server_run: invalid argument");
+		debug_log("server", "server_run: invalid argument");
 		return -1;
 	}
 
-	DBG("server_run: cfg=%p vfs=%p vfs_server=%p cache=%p", (void*)cfg,
-	    (void*)vfs, (void*)vfs_server, (void*)cache);
+	debug_log("server", "server_run: cfg=%p vfs=%p vfs_server=%p cache=%p",
+	          (void*)cfg, (void*)vfs, (void*)vfs_server, (void*)cache);
 
 	listener = make_listener(cfg);
 
 	if (listener < 0) {
-		DBG("server_run: make_listener failed");
+		debug_log("server", "server_run: make_listener failed");
 		return -1;
 	}
 
@@ -124,21 +111,21 @@ s4 server_run(const struct config* cfg, struct vfs* vfs,
 
 	fflush(stdout);
 
-	DBG("server_run: entering accept loop");
+	debug_log("server", "server_run: entering accept loop");
 
 	for (;;) {
-		DBG("server_run: waiting for accept");
+		debug_log("server", "server_run: waiting for accept");
 
 		client_fd = accept(listener, NULL, NULL);
 
 		if (client_fd < 0) {
 			if (errno == EINTR) {
-				DBG("server_run: accept interrupted");
+				debug_log("server", "server_run: accept interrupted");
 				continue;
 			}
 
 			if (errno == ECONNABORTED) {
-				DBG("server_run: accept ECONNABORTED, continuing");
+				debug_log("server", "server_run: accept ECONNABORTED, continuing");
 				continue;
 			}
 
@@ -155,17 +142,17 @@ s4 server_run(const struct config* cfg, struct vfs* vfs,
 			return -1;
 		}
 
-		DBG("server_run: accepted client fd=%d", client_fd);
+		debug_log("server", "server_run: accepted client fd=%d", client_fd);
 
-		DBG("server_run: starting worker for fd=%d", client_fd);
+		debug_log("server", "server_run: starting worker for fd=%d", client_fd);
 
 		rc = server_thread_start(client_fd, vfs, vfs_server, cache);
 
-		DBG("server_run: server_thread_start returned %d", (int)rc);
+		debug_log("server", "server_run: server_thread_start returned %d", (int)rc);
 
 		if (rc < 0) {
-			DBG("server_run: worker creation failed fd=%d",
-			    client_fd);
+			debug_log("server", "server_run: worker creation failed fd=%d",
+			          client_fd);
 
 			send(client_fd,
 			     "HTTP/1.1 503 Service Unavailable\r\n"
@@ -185,8 +172,8 @@ s4 server_run(const struct config* cfg, struct vfs* vfs,
 
 			close(client_fd);
 
-			DBG("server_run: closed failed client fd=%d",
-			    client_fd);
+			debug_log("server", "server_run: closed failed client fd=%d",
+			          client_fd);
 		}
 	}
 }
