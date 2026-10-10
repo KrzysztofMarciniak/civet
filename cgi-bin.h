@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "request_parser.h"
+#include "send.h"
 #include "vfs.h"
 
 #define CGI_MAX_ENV_VARS 128
@@ -38,6 +39,6 @@ s4 cgi_match(const struct vfs* vfs, const char* url_path,
              const struct vfs_entry** out);
 
 s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
-           const struct cgi_request* req, int out_fd);
+           const struct cgi_request* req, struct client_transport* transport);
 
 #endif

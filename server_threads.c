@@ -17,6 +17,11 @@
 #include "cgi-bin.h"
 #include "debug.h"
 #include "request_parser.h"
+#include "send.h"
+
+#ifdef ENABLE_TLS
+#include "tls_interface.h"
+#endif
 
 #define SERVER_REQUEST_BUF 16384
 #define SERVER_FILE_BUF 8192
@@ -24,22 +29,112 @@
 #define SERVER_REQUEST_TIMEOUT_SECS 10
 
 static pthread_mutex_t thread_mutex = PTHREAD_MUTEX_INITIALIZER;
-static s4 thread_count              = 0;
+static s4 thread_count = 0;
+
+#ifdef ENABLE_TLS
+/*
+ * Store the TLS connection in pthread-specific storage so the existing
+ * request handlers can use TLS-aware read helpers without sharing
+ * connection state between worker threads.
+ */
+static pthread_key_t tls_connection_key;
+static pthread_once_t tls_connection_key_once = PTHREAD_ONCE_INIT;
+static int tls_connection_key_status = -1;
+
+static void create_tls_connection_key(void)
+{
+        tls_connection_key_status =
+            pthread_key_create(&tls_connection_key, NULL);
+}
+
+static struct tls_connection *current_tls_connection(void)
+{
+        int rc;
+
+        rc = pthread_once(&tls_connection_key_once,
+                          create_tls_connection_key);
+        if (rc != 0 || tls_connection_key_status != 0)
+                return NULL;
+
+        return (struct tls_connection *)pthread_getspecific(
+            tls_connection_key);
+}
+#endif
 
 /*
- * Debug logging helpers.
- *
- * Keep the normal debug_log() calls, but add values around the places where
- * failures can otherwise look identical from the outside.
+ * Read from the client connection. TLS builds must never silently fall back
+ * to plaintext socket I/O.
  */
+static ssize_t client_recv(int fd, void *buf, size_t len, int flags)
+{
+#ifdef ENABLE_TLS
+        struct tls_connection *conn;
 
-static s4 set_socket_timeouts(int fd) {
+        (void)fd;
+        (void)flags;
+
+        conn = current_tls_connection();
+        if (conn == NULL) {
+                errno = ENOTCONN;
+                return -1;
+        }
+
+        return tls_connection_read(conn, buf, len);
+#else
+        return recv(fd, buf, len, flags);
+#endif
+}
+
+/*
+ * Compatibility adapter for the existing request handlers.
+ *
+ * All outgoing data is sent through client_send_all() from send.h.
+ * In TLS builds, the transport uses the current worker's TLS connection.
+ * In non-TLS builds, the transport uses the plain socket descriptor.
+ */
+static s4 send_all(int fd, const char *buf, size_t len)
+{
+        struct client_transport transport;
+
+        transport.fd = fd;
+
+#ifdef ENABLE_TLS
+        transport.tls_conn = current_tls_connection();
+
+        if (transport.tls_conn == NULL) {
+                errno = ENOTCONN;
+                debug_log("thread",
+                          "send_all: no TLS connection for fd=%d", fd);
+                return -1;
+        }
+#endif
+
+        debug_log("thread", "send_all: ENTER");
+        debug_log("thread", "send_all: fd=%d len=%lu",
+                  fd, (unsigned long)len);
+
+        if (client_send_all(&transport, buf, len) < 0) {
+                debug_log("thread",
+                          "send_all: client_send_all failed: fd=%d "
+                          "errno=%d (%s), len=%lu",
+                          fd, errno, strerror(errno), (unsigned long)len);
+                return -1;
+        }
+
+        debug_log("thread", "send_all: EXIT fd=%d sent=%lu",
+                  fd, (unsigned long)len);
+
+        return 0;
+}
+
+static s4 set_socket_timeouts(int fd)
+{
         struct timeval tv;
 
         debug_log("thread", "set_socket_timeouts: ENTER");
         debug_log("thread", "set_socket_timeouts: fd=%d", fd);
 
-        tv.tv_sec  = SERVER_SOCKET_TIMEOUT_SECS;
+        tv.tv_sec = SERVER_SOCKET_TIMEOUT_SECS;
         tv.tv_usec = 0;
 
         debug_log("thread", "set_socket_timeouts: setting SO_RCVTIMEO");
@@ -53,7 +148,6 @@ static s4 set_socket_timeouts(int fd) {
         }
 
         debug_log("thread", "set_socket_timeouts: SO_RCVTIMEO OK");
-
         debug_log("thread", "set_socket_timeouts: setting SO_SNDTIMEO");
 
         if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
@@ -70,59 +164,9 @@ static s4 set_socket_timeouts(int fd) {
         return 0;
 }
 
-static s4 send_all(int fd, const char* buf, size_t len) {
-        ssize_t n;
-        size_t original_len;
-
-        original_len = len;
-
-        debug_log("thread", "send_all: ENTER");
-        debug_log("thread", "send_all: fd=%d len=%lu", fd, (unsigned long)len);
-
-        while (len > 0) {
-                n = send(fd, buf, len, 0);
-
-                if (n < 0) {
-                        if (errno == EINTR) {
-                                debug_log("thread",
-                                          "send_all: send interrupted by "
-                                          "signal, retrying");
-                                continue;
-                        }
-
-                        debug_log("thread",
-                                  "send_all: send failed: fd=%d errno=%d "
-                                  "(%s), remaining=%lu original=%lu",
-                                  fd, errno, strerror(errno),
-                                  (unsigned long)len,
-                                  (unsigned long)original_len);
-
-                        return -1;
-                }
-
-                if (n == 0) {
-                        debug_log("thread",
-                                  "send_all: send returned zero: fd=%d "
-                                  "remaining=%lu",
-                                  fd, (unsigned long)len);
-                        return -1;
-                }
-
-                debug_log("thread", "send_all: sent=%ld remaining_before=%lu",
-                          (long)n, (unsigned long)len);
-
-                buf += n;
-                len -= (size_t)n;
-        }
-
-        debug_log("thread", "send_all: EXIT fd=%d sent=%lu", fd,
-                  (unsigned long)original_len);
-
-        return 0;
-}
-
-static s4 send_response(int fd, int status, const char* reason,
-                        const char* type, const char* body) {
+static s4 send_response(int fd, int status, const char *reason,
+                        const char *type, const char *body)
+{
         char buf[1024];
         int n;
         size_t len;
@@ -140,7 +184,8 @@ static s4 send_response(int fd, int status, const char* reason,
 
         len = strlen(body);
 
-        debug_log("thread", "send_response: body_len=%lu", (unsigned long)len);
+        debug_log("thread", "send_response: body_len=%lu",
+                  (unsigned long)len);
 
         n = snprintf(buf, sizeof(buf),
                      "HTTP/1.1 %d %s\r\n"
@@ -185,54 +230,56 @@ static s4 send_response(int fd, int status, const char* reason,
         return 0;
 }
 
-static const char* mime_type(const char* path) {
-        const char* dot;
+static const char *mime_type(const char *path)
+{
+        const char *dot;
 
         debug_log("thread", "mime_type: path='%s'",
                   path != NULL ? path : "(null)");
 
         dot = strrchr(path, '.');
 
-        if (dot == NULL) return "application/octet-stream";
+        if (dot == NULL)
+                return "application/octet-stream";
 
         if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0)
                 return "text/html";
-
-        if (strcmp(dot, ".css") == 0) return "text/css";
-
-        if (strcmp(dot, ".js") == 0) return "application/javascript";
-
-        if (strcmp(dot, ".json") == 0) return "application/json";
-
-        if (strcmp(dot, ".txt") == 0) return "text/plain";
-
-        if (strcmp(dot, ".xml") == 0) return "application/xml";
-
-        if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
-
-        if (strcmp(dot, ".png") == 0) return "image/png";
-
-        if (strcmp(dot, ".gif") == 0) return "image/gif";
-
+        if (strcmp(dot, ".css") == 0)
+                return "text/css";
+        if (strcmp(dot, ".js") == 0)
+                return "application/javascript";
+        if (strcmp(dot, ".json") == 0)
+                return "application/json";
+        if (strcmp(dot, ".txt") == 0)
+                return "text/plain";
+        if (strcmp(dot, ".xml") == 0)
+                return "application/xml";
+        if (strcmp(dot, ".svg") == 0)
+                return "image/svg+xml";
+        if (strcmp(dot, ".png") == 0)
+                return "image/png";
+        if (strcmp(dot, ".gif") == 0)
+                return "image/gif";
         if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0)
                 return "image/jpeg";
-
-        if (strcmp(dot, ".webp") == 0) return "image/webp";
-
-        if (strcmp(dot, ".ico") == 0) return "image/x-icon";
-
-        if (strcmp(dot, ".pdf") == 0) return "application/pdf";
+        if (strcmp(dot, ".webp") == 0)
+                return "image/webp";
+        if (strcmp(dot, ".ico") == 0)
+                return "image/x-icon";
+        if (strcmp(dot, ".pdf") == 0)
+                return "application/pdf";
 
         return "application/octet-stream";
 }
 
-static s4 send_file_headers(int fd, const char* path, off_t size) {
+static s4 send_file_headers(int fd, const char *path, off_t size)
+{
         char buf[1024];
         int n;
 
         debug_log("thread", "send_file_headers: ENTER");
-        debug_log("thread", "send_file_headers: fd=%d path='%s' size=%lu", fd,
-                  path != NULL ? path : "(null)", (unsigned long)size);
+        debug_log("thread", "send_file_headers: fd=%d path='%s' size=%lu",
+                  fd, path != NULL ? path : "(null)", (unsigned long)size);
 
         n = snprintf(buf, sizeof(buf),
                      "HTTP/1.1 200 OK\r\n"
@@ -267,18 +314,20 @@ static s4 send_file_headers(int fd, const char* path, off_t size) {
         return 0;
 }
 
-static s4 send_cached_file(int fd, const struct cache_entry* entry,
-                           s4 head_only) {
+static s4 send_cached_file(int fd, const struct cache_entry *entry,
+                           s4 head_only)
+{
         char buf[1024];
         int n;
 
         debug_log("thread", "send_cached_file: ENTER");
-
-        debug_log(
-            "thread", "send_cached_file: fd=%d url='%s' size=%lu head=%d", fd,
-            entry != NULL && entry->url_path != NULL ? entry->url_path
-                                                     : "(null)",
-            entry != NULL ? (unsigned long)entry->size : 0UL, (int)head_only);
+        debug_log("thread", "send_cached_file: fd=%d url='%s' size=%lu head=%d",
+                  fd,
+                  entry != NULL && entry->url_path != NULL
+                      ? entry->url_path
+                      : "(null)",
+                  entry != NULL ? (unsigned long)entry->size : 0UL,
+                  (int)head_only);
 
         n = snprintf(buf, sizeof(buf),
                      "HTTP/1.1 200 OK\r\n"
@@ -327,7 +376,8 @@ static s4 send_cached_file(int fd, const struct cache_entry* entry,
         return 0;
 }
 
-static s4 send_file(int fd, int file_fd, const char* url_path, s4 head_only) {
+static s4 send_file(int fd, int file_fd, const char *url_path, s4 head_only)
+{
         struct stat st;
         char buf[SERVER_FILE_BUF];
         ssize_t n;
@@ -336,8 +386,8 @@ static s4 send_file(int fd, int file_fd, const char* url_path, s4 head_only) {
         total_sent = 0;
 
         debug_log("thread", "send_file: ENTER");
-        debug_log("thread", "send_file: fd=%d file_fd=%d url='%s' head=%d", fd,
-                  file_fd, url_path != NULL ? url_path : "(null)",
+        debug_log("thread", "send_file: fd=%d file_fd=%d url='%s' head=%d",
+                  fd, file_fd, url_path != NULL ? url_path : "(null)",
                   (int)head_only);
 
         if (fstat(file_fd, &st) < 0) {
@@ -385,7 +435,8 @@ static s4 send_file(int fd, int file_fd, const char* url_path, s4 head_only) {
                         return -1;
                 }
 
-                if (n == 0) break;
+                if (n == 0)
+                        break;
 
                 debug_log("thread", "send_file: read %ld bytes", (long)n);
 
@@ -407,11 +458,12 @@ static s4 send_file(int fd, int file_fd, const char* url_path, s4 head_only) {
         return 0;
 }
 
-static const struct vfs_entry* find_index(const struct vfs* vfs,
-                                          const char* path) {
+static const struct vfs_entry *find_index(const struct vfs *vfs,
+                                          const char *path)
+{
         char index_path[REQUEST_MAX_TARGET];
         size_t len;
-        const struct vfs_entry* entry;
+        const struct vfs_entry *entry;
 
         debug_log("thread", "find_index: ENTER");
         debug_log("thread", "find_index: path='%s'",
@@ -424,7 +476,7 @@ static const struct vfs_entry* find_index(const struct vfs* vfs,
                 entry = vfs_lookup(vfs, "/index.html");
 
                 debug_log("thread", "find_index: root lookup complete entry=%p",
-                          (void*)entry);
+                          (void *)entry);
 
                 if (entry != NULL && entry->type == VFS_FILE) {
                         debug_log("thread", "find_index: /index.html FOUND");
@@ -446,7 +498,8 @@ static const struct vfs_entry* find_index(const struct vfs* vfs,
 
         memcpy(index_path, path, len);
 
-        if (index_path[len - 1] != '/') index_path[len++] = '/';
+        if (index_path[len - 1] != '/')
+                index_path[len++] = '/';
 
         memcpy(index_path + len, "index.html", sizeof("index.html"));
 
@@ -455,7 +508,7 @@ static const struct vfs_entry* find_index(const struct vfs* vfs,
         entry = vfs_lookup(vfs, index_path);
 
         debug_log("thread", "find_index: lookup complete entry=%p",
-                  (void*)entry);
+                  (void *)entry);
 
         if (entry != NULL && entry->type == VFS_FILE) {
                 debug_log("thread", "find_index: FOUND '%s'", index_path);
@@ -467,7 +520,8 @@ static const struct vfs_entry* find_index(const struct vfs* vfs,
         return NULL;
 }
 
-static const char* method_name(s4 method) {
+static const char *method_name(s4 method)
+{
         switch (method) {
                 case REQUEST_METHOD_HEAD:
                         return "HEAD";
@@ -484,7 +538,8 @@ static const char* method_name(s4 method) {
         }
 }
 
-static s4 send_405(int fd) {
+static s4 send_405(int fd)
+{
         static const char msg[] =
             "HTTP/1.1 405 Method Not Allowed\r\n"
             "Allow: GET, HEAD\r\n"
@@ -507,14 +562,14 @@ static s4 send_405(int fd) {
 }
 
 /*
- * Collects req->content_length body bytes: first what handle_client already
- * received after the headers (pre), then the rest from the socket.
- * Returns 0 on success (*out may be NULL for an empty body), -1 on failure.
+ * Collect a CGI request body. Uses client_recv()/send_all(), so it is
+ * TLS-aware.
  */
-static s4 read_body(int fd, const struct http_request* req, const char* pre,
-                    size_t pre_len, char** out, size_t* out_len) {
-        const struct request_header* h;
-        char* body;
+static s4 read_body(int fd, const struct http_request *req, const char *pre,
+                    size_t pre_len, char **out, size_t *out_len)
+{
+        const struct request_header *h;
+        char *body;
         size_t want;
         size_t got;
         ssize_t n;
@@ -522,7 +577,7 @@ static s4 read_body(int fd, const struct http_request* req, const char* pre,
 
         debug_log("thread", "read_body: ENTER");
 
-        *out     = NULL;
+        *out = NULL;
         *out_len = 0;
 
         want = (size_t)req->content_length;
@@ -535,7 +590,7 @@ static s4 read_body(int fd, const struct http_request* req, const char* pre,
                 return 0;
         }
 
-        body = (char*)malloc(want);
+        body = (char *)malloc(want);
 
         if (body == NULL) {
                 debug_log("thread",
@@ -597,7 +652,7 @@ static s4 read_body(int fd, const struct http_request* req, const char* pre,
                 debug_log("thread", "read_body: BEFORE recv got=%lu want=%lu",
                           (unsigned long)got, (unsigned long)want);
 
-                n = recv(fd, body + got, want - got, 0);
+                n = client_recv(fd, body + got, want - got, 0);
 
                 debug_log("thread", "read_body: AFTER recv n=%ld errno=%d",
                           (long)n, errno);
@@ -632,7 +687,7 @@ static s4 read_body(int fd, const struct http_request* req, const char* pre,
                           (long)n, (unsigned long)got, (unsigned long)want);
         }
 
-        *out     = body;
+        *out = body;
         *out_len = want;
 
         debug_log("thread", "read_body: SUCCESS body_len=%lu",
@@ -641,32 +696,31 @@ static s4 read_body(int fd, const struct http_request* req, const char* pre,
         return 0;
 }
 
-static s4 handle_cgi(int fd, const struct vfs* vfs, const struct vfs_entry* ce,
-                     const struct http_request* req, const char* pre,
-                     size_t pre_len) {
+static s4 handle_cgi(int fd, const struct vfs *vfs, const struct vfs_entry *ce,
+                     const struct http_request *req, const char *pre,
+                     size_t pre_len)
+{
         struct cgi_request creq;
+        struct client_transport transport;
         struct sockaddr_in peer;
         struct sockaddr_in local;
-        const struct request_header* h;
+        const struct request_header *h;
         socklen_t plen;
         socklen_t llen;
         char remote[INET_ADDRSTRLEN];
         char server[INET_ADDRSTRLEN];
         char port[8];
         char ctype[512];
-        char* body;
+        char *body;
         size_t body_len;
         size_t n;
-        const char* q;
+        const char *q;
         s4 rc;
 
         debug_log("thread", "handle_cgi: ENTER");
-
-        debug_log("thread", "handle_cgi: fd=%d ce=%p pre_len=%lu", fd,
-                  (void*)ce, (unsigned long)pre_len);
-
+        debug_log("thread", "handle_cgi: fd=%d ce=%p pre_len=%lu",
+                  fd, (void *)ce, (unsigned long)pre_len);
         debug_log("thread", "handle_cgi: target='%s'", req->target);
-
         debug_log("thread", "handle_cgi: method=%s content_length=%lu",
                   method_name(req->method), (unsigned long)req->content_length);
 
@@ -700,7 +754,7 @@ static s4 handle_cgi(int fd, const struct vfs* vfs, const struct vfs_entry* ce,
 
         debug_log("thread", "handle_cgi: BEFORE getpeername");
 
-        if (getpeername(fd, (struct sockaddr*)&peer, &plen) == 0) {
+        if (getpeername(fd, (struct sockaddr *)&peer, &plen) == 0) {
                 if (inet_ntop(AF_INET, &peer.sin_addr, remote,
                               sizeof(remote)) == NULL) {
                         debug_log("thread",
@@ -718,7 +772,7 @@ static s4 handle_cgi(int fd, const struct vfs* vfs, const struct vfs_entry* ce,
 
         debug_log("thread", "handle_cgi: BEFORE getsockname");
 
-        if (getsockname(fd, (struct sockaddr*)&local, &llen) == 0) {
+        if (getsockname(fd, (struct sockaddr *)&local, &llen) == 0) {
                 if (inet_ntop(AF_INET, &local.sin_addr, server,
                               sizeof(server)) == NULL) {
                         debug_log("thread",
@@ -737,7 +791,6 @@ static s4 handle_cgi(int fd, const struct vfs* vfs, const struct vfs_entry* ce,
         debug_log("thread", "handle_cgi: server='%s' port='%s'", server, port);
 
         ctype[0] = '\0';
-
         h = request_header_get(req, "Content-Type");
 
         if (h != NULL) {
@@ -762,237 +815,146 @@ static s4 handle_cgi(int fd, const struct vfs* vfs, const struct vfs_entry* ce,
 
         memset(&creq, 0, sizeof(creq));
 
-        creq.method       = method_name(req->method);
-        creq.query        = q != NULL ? q + 1 : "";
+        creq.method = method_name(req->method);
+        creq.query = q != NULL ? q + 1 : "";
         creq.content_type = ctype;
-        creq.remote_addr  = remote;
-        creq.server_name  = server;
-        creq.server_port  = port;
-        creq.body         = body;
-        creq.body_len     = body_len;
-        creq.headers      = req->headers;
+        creq.remote_addr = remote;
+        creq.server_name = server;
+        creq.server_port = port;
+        creq.body = body;
+        creq.body_len = body_len;
+        creq.headers = req->headers;
         creq.header_count = (size_t)req->header_count;
 
-        debug_log("thread", "handle_cgi: CGI request prepared");
-        debug_log("thread", "handle_cgi: CGI method='%s'", creq.method);
-        debug_log("thread", "handle_cgi: CGI query='%s'", creq.query);
-        debug_log("thread", "handle_cgi: CGI content_type='%s'",
-                  creq.content_type);
-        debug_log("thread", "handle_cgi: CGI remote_addr='%s'",
-                  creq.remote_addr);
-        debug_log("thread", "handle_cgi: CGI server_name='%s'",
-                  creq.server_name);
-        debug_log("thread", "handle_cgi: CGI server_port='%s'",
-                  creq.server_port);
-        debug_log("thread", "handle_cgi: CGI body_len=%lu",
-                  (unsigned long)creq.body_len);
-        debug_log("thread", "handle_cgi: CGI header_count=%lu",
-                  (unsigned long)creq.header_count);
+        memset(&transport, 0, sizeof(transport));
+        transport.fd = fd;
 
+#ifdef ENABLE_TLS
+        transport.tls_conn = current_tls_connection();
+
+        if (transport.tls_conn == NULL) {
+                debug_log("thread", "handle_cgi: no TLS connection");
+                free(body);
+                return -1;
+        }
+#endif
+
+        debug_log("thread", "handle_cgi: CGI request prepared");
         debug_log("thread", "handle_cgi: BEFORE cgi_run");
 
-        rc = cgi_run(vfs, ce, &creq, fd);
+        rc = cgi_run(vfs, ce, &creq, &transport);
 
         debug_log("thread", "handle_cgi: AFTER cgi_run rc=%d", (int)rc);
 
         free(body);
 
-        debug_log("thread", "handle_cgi: body freed");
         debug_log("thread", "handle_cgi: EXIT rc=%d", (int)rc);
 
         return rc;
 }
 
-static s4 handle_request(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
-                         struct cache* cache, const struct http_request* req,
-                         const char* pre, size_t pre_len) {
+static s4 handle_request(int fd, struct vfs *vfs,
+                         struct vfs_server *vfs_server, struct cache *cache,
+                         const struct http_request *req, const char *pre,
+                         size_t pre_len)
+{
         char path[REQUEST_MAX_TARGET];
         size_t len;
-        const struct vfs_entry* entry;
-        const struct cache_entry* cached;
+        const struct vfs_entry *entry;
+        const struct cache_entry *cached;
         int file_fd;
 
         debug_log("thread", "handle_request: ENTER");
-
-        debug_log("thread", "handle_request: fd=%d target='%s'", fd,
-                  req->target);
-
+        debug_log("thread", "handle_request: fd=%d target='%s'", fd, req->target);
         debug_log("thread", "handle_request: method=%s",
                   method_name(req->method));
-
         debug_log("thread", "handle_request: content_length=%lu",
                   (unsigned long)req->content_length);
-
-        debug_log("thread", "handle_request: header_count=%lu",
-                  (unsigned long)req->header_count);
-
         debug_log("thread", "handle_request: pre_len=%lu",
                   (unsigned long)pre_len);
 
-        debug_log("thread", "handle_request: BEFORE normalize");
-
         if (vfs_normalize_path(req->target, path, sizeof(path)) != VFS_OK) {
-                debug_log("thread",
-                          "handle_request: normalize FAILED target='%s'",
-                          req->target);
+                debug_log("thread", "handle_request: normalize FAILED");
 
                 return send_response(fd, 400, "Bad Request", "text/plain",
                                      "bad request\n");
         }
 
-        debug_log("thread", "handle_request: AFTER normalize path='%s'", path);
-
         len = strlen(path);
 
-        while (len > 1 && path[len - 1] == '/') path[--len] = '\0';
-
-        debug_log("thread",
-                  "handle_request: normalized/trailing-slash path='%s'", path);
+        while (len > 1 && path[len - 1] == '/')
+                path[--len] = '\0';
 
         /*
-         * CGI must be checked before the static path so scripts and binaries
-         * under /cgi-bin/ can never be served as raw files.
+         * CGI must be checked before static paths so scripts can never be
+         * served as raw files.
          */
         if (strncmp(path, CGI_PREFIX, sizeof(CGI_PREFIX) - 1) == 0) {
-                const struct vfs_entry* ce;
+                const struct vfs_entry *ce;
 
-                debug_log("thread", "handle_request: CGI PREFIX MATCH");
-
-                debug_log("thread",
-                          "handle_request: BEFORE cgi_match path='%s'", path);
-
-                if (cgi_match(vfs, path, &ce) == VFS_OK) {
-                        debug_log("thread",
-                                  "handle_request: cgi_match SUCCESS ce=%p",
-                                  (void*)ce);
-
+                if (cgi_match(vfs, path, &ce) == VFS_OK)
                         return handle_cgi(fd, vfs, ce, req, pre, pre_len);
-                }
-
-                debug_log("thread",
-                          "handle_request: cgi_match FAILED path='%s'", path);
 
                 return send_response(fd, 404, "Not Found", "text/plain",
                                      "not found\n");
         }
 
-        debug_log("thread", "handle_request: NOT CGI");
-
-        /* static files: GET and HEAD only */
         if (req->method != REQUEST_METHOD_GET &&
             req->method != REQUEST_METHOD_HEAD) {
-                debug_log("thread",
-                          "handle_request: unsupported static method=%s",
-                          method_name(req->method));
                 return send_405(fd);
         }
 
-        debug_log("thread", "handle_request: BEFORE vfs_lookup");
-        debug_log("thread", "handle_request: lookup path='%s'", path);
-
         entry = vfs_lookup(vfs, path);
 
-        debug_log("thread", "handle_request: AFTER vfs_lookup entry=%p",
-                  (void*)entry);
-
         if (entry == NULL) {
-                debug_log("thread", "handle_request: NOT FOUND path='%s'",
-                          path);
-
                 return send_response(fd, 404, "Not Found", "text/plain",
                                      "not found\n");
         }
 
-        debug_log("thread", "handle_request: entry found type=%d url='%s'",
-                  (int)entry->type,
-                  entry->url_path != NULL ? entry->url_path : "(null)");
-
         if (entry->type == VFS_DIRECTORY) {
-                debug_log("thread", "handle_request: entry is DIRECTORY");
-
                 entry = find_index(vfs, path);
 
-                debug_log("thread", "handle_request: AFTER find_index entry=%p",
-                          (void*)entry);
-
                 if (entry == NULL) {
-                        debug_log("thread",
-                                  "handle_request: directory has no index");
                         return send_response(fd, 404, "Not Found", "text/plain",
                                              "not found\n");
                 }
         }
 
         if (entry->type != VFS_FILE) {
-                debug_log("thread", "handle_request: entry is not file type=%d",
-                          (int)entry->type);
-
                 return send_response(fd, 404, "Not Found", "text/plain",
                                      "not found\n");
         }
 
-        debug_log("thread", "handle_request: BEFORE cache_lookup url='%s'",
-                  entry->url_path);
-
         cached = cache_lookup(cache, entry->url_path);
 
-        debug_log("thread", "handle_request: AFTER cache_lookup cached=%p",
-                  (void*)cached);
-
         if (cached != NULL) {
-                debug_log("thread", "handle_request: cache HIT");
-
                 return send_cached_file(fd, cached,
                                         req->method == REQUEST_METHOD_HEAD);
         }
 
-        debug_log("thread", "handle_request: cache MISS");
-
-        debug_log("thread", "handle_request: BEFORE vfs_server_open");
-
-        errno   = 0;
+        errno = 0;
         file_fd = vfs_server_open(vfs_server, entry);
-
-        debug_log("thread",
-                  "handle_request: AFTER vfs_server_open fd=%d errno=%d (%s)",
-                  file_fd, errno, strerror(errno));
 
         if (file_fd < 0) {
                 if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP ||
                     errno == EACCES) {
-                        debug_log("thread",
-                                  "handle_request: open mapped to 404");
                         return send_response(fd, 404, "Not Found", "text/plain",
                                              "not found\n");
                 }
-
-                debug_log("thread", "handle_request: open mapped to 500");
 
                 return send_response(fd, 500, "Internal Server Error",
                                      "text/plain", "internal server error\n");
         }
 
-        debug_log("thread", "handle_request: file opened fd=%d", file_fd);
-
-        debug_log("thread", "handle_request: BEFORE send_file");
-
-        {
-                s4 send_rc;
-
-                send_rc = send_file(fd, file_fd, entry->url_path,
-                                    req->method == REQUEST_METHOD_HEAD);
-
-                debug_log("thread", "handle_request: AFTER send_file rc=%d",
-                          (int)send_rc);
-
-                return send_rc;
-        }
+        return send_file(fd, file_fd, entry->url_path,
+                         req->method == REQUEST_METHOD_HEAD);
 }
 
-static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
-                        struct cache* cache) {
+static s4 handle_client(int fd, struct vfs *vfs,
+                        struct vfs_server *vfs_server, struct cache *cache)
+{
         char buf[SERVER_REQUEST_BUF];
-        struct http_request* req;
+        struct http_request *req;
         size_t used;
         size_t consumed;
         ssize_t n;
@@ -1002,30 +964,22 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
         debug_log("thread", "handle_client: ENTER");
         debug_log("thread", "handle_client: fd=%d", fd);
 
-        req = (struct http_request*)malloc(sizeof(*req));
+        req = (struct http_request *)malloc(sizeof(*req));
 
         if (req == NULL) {
-                debug_log("thread",
-                          "handle_client: malloc failed: errno=%d (%s)", errno,
+                debug_log("thread", "handle_client: malloc failed: %s",
                           strerror(errno));
                 return -1;
         }
 
-        used     = 0;
+        used = 0;
         consumed = 0;
         deadline = time(NULL) + SERVER_REQUEST_TIMEOUT_SECS;
-
-        debug_log("thread", "handle_client: request deadline=%ld",
-                  (long)deadline);
-
-        debug_log("thread", "handle_client: BEFORE recv");
 
         for (;;) {
                 if (time(NULL) >= deadline) {
                         debug_log("thread",
-                                  "handle_client: REQUEST DEADLINE EXCEEDED "
-                                  "used=%lu",
-                                  (unsigned long)used);
+                                  "handle_client: REQUEST DEADLINE EXCEEDED");
                         free(req);
                         return -1;
                 }
@@ -1034,29 +988,24 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
                           "handle_client: recv buffer used=%lu capacity=%lu",
                           (unsigned long)used, (unsigned long)sizeof(buf));
 
-                n = recv(fd, buf + used, sizeof(buf) - used, 0);
+                n = client_recv(fd, buf + used, sizeof(buf) - used, 0);
 
                 debug_log("thread",
                           "handle_client: AFTER recv n=%ld errno=%d (%s)",
                           (long)n, errno, strerror(errno));
 
                 if (n < 0) {
-                        if (errno == EINTR) {
-                                debug_log("thread",
-                                          "handle_client: recv EINTR");
+                        if (errno == EINTR)
                                 continue;
-                        }
 
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                                 debug_log("thread",
                                           "handle_client: recv TIMEOUT");
-                                free(req);
-                                return -1;
+                        } else {
+                                debug_log("thread",
+                                          "handle_client: recv FAILED");
                         }
 
-                        debug_log("thread",
-                                  "handle_client: recv FAILED errno=%d (%s)",
-                                  errno, strerror(errno));
                         free(req);
                         return -1;
                 }
@@ -1069,12 +1018,6 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
 
                 used += (size_t)n;
 
-                debug_log("thread",
-                          "handle_client: received=%ld total_used=%lu", (long)n,
-                          (unsigned long)used);
-
-                debug_log("thread", "handle_client: BEFORE request_parse");
-
                 rc = request_parse(buf, used, req, &consumed);
 
                 debug_log("thread",
@@ -1083,14 +1026,7 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
                           (int)rc, (unsigned long)consumed);
 
                 if (rc == REQUEST_PARSE_INCOMPLETE) {
-                        debug_log("thread",
-                                  "handle_client: request incomplete");
-
                         if (used == sizeof(buf)) {
-                                debug_log("thread",
-                                          "handle_client: request buffer "
-                                          "FULL");
-
                                 send_response(
                                     fd, 431, "Request Header Fields Too Large",
                                     "text/plain", "request too large\n");
@@ -1103,10 +1039,6 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
                 }
 
                 if (rc == REQUEST_PARSE_TOO_LARGE) {
-                        debug_log("thread",
-                                  "handle_client: request parser says "
-                                  "TOO LARGE");
-
                         send_response(fd, 431,
                                       "Request Header Fields Too Large",
                                       "text/plain", "request too large\n");
@@ -1116,11 +1048,6 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
                 }
 
                 if (rc != REQUEST_PARSE_OK) {
-                        debug_log("thread",
-                                  "handle_client: request parser FAILED "
-                                  "rc=%d",
-                                  (int)rc);
-
                         send_response(fd, 400, "Bad Request", "text/plain",
                                       "bad request\n");
 
@@ -1128,29 +1055,15 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
                         return -1;
                 }
 
-                debug_log("thread",
-                          "handle_client: request parsed successfully");
-
+                debug_log("thread", "handle_client: request parsed");
                 debug_log("thread", "handle_client: target='%s'", req->target);
-
                 debug_log("thread", "handle_client: method=%s",
                           method_name(req->method));
-
                 debug_log("thread", "handle_client: content_length=%lu",
                           (unsigned long)req->content_length);
 
-                debug_log("thread", "handle_client: header_count=%lu",
-                          (unsigned long)req->header_count);
-
-                debug_log("thread",
-                          "handle_client: consumed=%lu used=%lu pre=%lu",
-                          (unsigned long)consumed, (unsigned long)used,
-                          (unsigned long)(used - consumed));
-
                 break;
         }
-
-        debug_log("thread", "handle_client: BEFORE handle_request");
 
         rc = handle_request(fd, vfs, vfs_server, cache, req, buf + consumed,
                             used - consumed);
@@ -1160,25 +1073,26 @@ static s4 handle_client(int fd, struct vfs* vfs, struct vfs_server* vfs_server,
 
         free(req);
 
-        debug_log("thread", "handle_client: req freed");
-        debug_log("thread", "handle_client: EXIT rc=%d", (int)rc);
-
         return rc;
 }
 
-static void* server_thread_main(void* arg) {
-        struct server_thread_args* args;
+static void *server_thread_main(void *arg)
+{
+        struct server_thread_args *args;
         int client_fd;
-        struct vfs* vfs;
-        struct vfs_server* vfs_server;
-        struct cache* cache;
+        struct vfs *vfs;
+        struct vfs_server *vfs_server;
+        struct cache *cache;
         s4 handle_rc;
+#ifdef ENABLE_TLS
+        struct tls_context *tls_ctx;
+        struct tls_connection *tls_conn;
+        int key_rc;
+#endif
 
         debug_log("thread", "server_thread_main: ENTER");
 
-        args = (struct server_thread_args*)arg;
-
-        debug_log("thread", "server_thread_main: args=%p", (void*)args);
+        args = (struct server_thread_args *)arg;
 
         if (args == NULL) {
                 debug_log("thread", "server_thread_main: args is NULL");
@@ -1186,19 +1100,14 @@ static void* server_thread_main(void* arg) {
         }
 
         client_fd = args->client_fd;
-        debug_log("thread", "server_thread_main: client_fd=%d", client_fd);
-
         vfs = args->vfs;
-        debug_log("thread", "server_thread_main: vfs=%p", (void*)vfs);
-
         vfs_server = args->vfs_server;
-        debug_log("thread", "server_thread_main: vfs_server=%p",
-                  (void*)vfs_server);
-
         cache = args->cache;
-        debug_log("thread", "server_thread_main: cache=%p", (void*)cache);
 
-        debug_log("thread", "server_thread_main: BEFORE set_socket_timeouts");
+#ifdef ENABLE_TLS
+        tls_ctx = args->tls_ctx;
+        tls_conn = NULL;
+#endif
 
         if (set_socket_timeouts(client_fd) < 0) {
                 debug_log("thread",
@@ -1208,20 +1117,110 @@ static void* server_thread_main(void* arg) {
 
                 pthread_mutex_lock(&thread_mutex);
                 thread_count--;
-                debug_log("thread",
-                          "server_thread_main: thread_count=%d after failure",
-                          (int)thread_count);
                 pthread_mutex_unlock(&thread_mutex);
 
                 free(args);
-
-                debug_log("thread",
-                          "server_thread_main: EXIT due to timeout setup");
-
                 return NULL;
         }
 
-        debug_log("thread", "server_thread_main: AFTER set_socket_timeouts");
+#ifdef ENABLE_TLS
+        key_rc = pthread_once(&tls_connection_key_once,
+                              create_tls_connection_key);
+
+        if (key_rc != 0 || tls_connection_key_status != 0) {
+                debug_log("thread",
+                          "server_thread_main: TLS pthread key creation "
+                          "failed");
+
+                close(client_fd);
+
+                pthread_mutex_lock(&thread_mutex);
+                thread_count--;
+                pthread_mutex_unlock(&thread_mutex);
+
+                free(args);
+                return NULL;
+        }
+
+        if (tls_ctx == NULL) {
+                debug_log("thread",
+                          "server_thread_main: missing TLS context");
+
+                close(client_fd);
+
+                pthread_mutex_lock(&thread_mutex);
+                thread_count--;
+                pthread_mutex_unlock(&thread_mutex);
+
+                free(args);
+                return NULL;
+        }
+
+        debug_log("thread",
+                  "server_thread_main: starting TLS handshake fd=%d",
+                  client_fd);
+
+        if (tls_connection_accept(tls_ctx, client_fd, &tls_conn) != 0) {
+                const char *error_text;
+
+                error_text = tls_last_error();
+
+                debug_log("thread",
+                          "server_thread_main: TLS handshake failed: %s",
+                          error_text != NULL ? error_text : "unknown TLS error");
+
+                if (tls_conn != NULL) {
+                        tls_connection_destroy(tls_conn);
+                        tls_conn = NULL;
+                }
+
+                close(client_fd);
+
+                pthread_mutex_lock(&thread_mutex);
+                thread_count--;
+                pthread_mutex_unlock(&thread_mutex);
+
+                free(args);
+                return NULL;
+        }
+
+        if (tls_conn == NULL) {
+                debug_log("thread",
+                          "server_thread_main: TLS accept returned no "
+                          "connection");
+
+                close(client_fd);
+
+                pthread_mutex_lock(&thread_mutex);
+                thread_count--;
+                pthread_mutex_unlock(&thread_mutex);
+
+                free(args);
+                return NULL;
+        }
+
+        key_rc = pthread_setspecific(tls_connection_key, tls_conn);
+
+        if (key_rc != 0) {
+                debug_log("thread",
+                          "server_thread_main: pthread_setspecific failed "
+                          "rc=%d",
+                          key_rc);
+
+                (void)tls_connection_shutdown(tls_conn);
+                tls_connection_destroy(tls_conn);
+                close(client_fd);
+
+                pthread_mutex_lock(&thread_mutex);
+                thread_count--;
+                pthread_mutex_unlock(&thread_mutex);
+
+                free(args);
+                return NULL;
+        }
+
+        debug_log("thread", "server_thread_main: TLS handshake complete");
+#endif
 
         debug_log("thread", "server_thread_main: BEFORE handle_client");
 
@@ -1230,6 +1229,17 @@ static void* server_thread_main(void* arg) {
         debug_log("thread", "server_thread_main: AFTER handle_client rc=%d",
                   (int)handle_rc);
 
+#ifdef ENABLE_TLS
+        /*
+         * Stop exposing this connection through thread-specific storage
+         * before shutting it down and freeing its TLS session.
+         */
+        (void)pthread_setspecific(tls_connection_key, NULL);
+        (void)tls_connection_shutdown(tls_conn);
+        tls_connection_destroy(tls_conn);
+        tls_conn = NULL;
+#endif
+
         debug_log("thread", "server_thread_main: closing client fd=%d",
                   client_fd);
 
@@ -1237,13 +1247,9 @@ static void* server_thread_main(void* arg) {
 
         pthread_mutex_lock(&thread_mutex);
         thread_count--;
-
         debug_log("thread", "server_thread_main: thread_count=%d",
                   (int)thread_count);
-
         pthread_mutex_unlock(&thread_mutex);
-
-        debug_log("thread", "server_thread_main: BEFORE free args");
 
         free(args);
 
@@ -1252,19 +1258,21 @@ static void* server_thread_main(void* arg) {
         return NULL;
 }
 
-s4 server_thread_start(int client_fd, struct vfs* vfs,
-                       struct vfs_server* vfs_server, struct cache* cache) {
+#ifdef ENABLE_TLS
+s4 server_thread_start(int client_fd, struct vfs *vfs,
+                       struct vfs_server *vfs_server, struct cache *cache,
+                       struct tls_context *tls_ctx)
+#else
+s4 server_thread_start(int client_fd, struct vfs *vfs,
+                       struct vfs_server *vfs_server, struct cache *cache)
+#endif
+{
         pthread_t thread;
         pthread_attr_t attr;
-        struct server_thread_args* args;
+        struct server_thread_args *args;
         int rc;
 
         debug_log("thread", "server_thread_start: ENTER");
-
-        debug_log("thread",
-                  "server_thread_start: client_fd=%d vfs=%p "
-                  "vfs_server=%p cache=%p",
-                  client_fd, (void*)vfs, (void*)vfs_server, (void*)cache);
 
         pthread_mutex_lock(&thread_mutex);
 
@@ -1278,21 +1286,14 @@ s4 server_thread_start(int client_fd, struct vfs* vfs,
                           "server_thread_start: THREAD LIMIT REACHED "
                           "count=%d max=%d",
                           (int)thread_count, SERVER_MAX_THREADS);
-
                 return -1;
         }
 
         thread_count++;
 
-        debug_log("thread", "server_thread_start: incremented thread_count=%d",
-                  (int)thread_count);
-
         pthread_mutex_unlock(&thread_mutex);
 
-        args = (struct server_thread_args*)malloc(sizeof(*args));
-
-        debug_log("thread", "server_thread_start: AFTER malloc args=%p",
-                  (void*)args);
+        args = (struct server_thread_args *)malloc(sizeof(*args));
 
         if (args == NULL) {
                 debug_log("thread",
@@ -1301,34 +1302,26 @@ s4 server_thread_start(int client_fd, struct vfs* vfs,
 
                 pthread_mutex_lock(&thread_mutex);
                 thread_count--;
-
-                debug_log("thread",
-                          "server_thread_start: thread_count=%d after "
-                          "malloc failure",
-                          (int)thread_count);
-
                 pthread_mutex_unlock(&thread_mutex);
 
                 return -1;
         }
 
-        args->client_fd  = client_fd;
-        args->vfs        = vfs;
+        args->client_fd = client_fd;
+        args->vfs = vfs;
         args->vfs_server = vfs_server;
-        args->cache      = cache;
+        args->cache = cache;
 
-        debug_log("thread", "server_thread_start: args initialized");
+#ifdef ENABLE_TLS
+        args->tls_ctx = tls_ctx;
+#endif
 
         rc = pthread_attr_init(&attr);
-
-        debug_log("thread",
-                  "server_thread_start: AFTER pthread_attr_init rc=%d", rc);
 
         if (rc != 0) {
                 debug_log("thread",
                           "server_thread_start: pthread_attr_init FAILED "
-                          "rc=%d",
-                          rc);
+                          "rc=%d", rc);
 
                 pthread_mutex_lock(&thread_mutex);
                 thread_count--;
@@ -1340,16 +1333,10 @@ s4 server_thread_start(int client_fd, struct vfs* vfs,
 
         rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-        debug_log("thread",
-                  "server_thread_start: AFTER pthread_attr_setdetachstate "
-                  "rc=%d",
-                  rc);
-
         if (rc != 0) {
                 debug_log("thread",
                           "server_thread_start: pthread_attr_setdetachstate "
-                          "FAILED rc=%d",
-                          rc);
+                          "FAILED rc=%d", rc);
 
                 pthread_attr_destroy(&attr);
 
@@ -1361,36 +1348,20 @@ s4 server_thread_start(int client_fd, struct vfs* vfs,
                 return -1;
         }
 
-        debug_log("thread", "server_thread_start: BEFORE pthread_create");
-
         rc = pthread_create(&thread, &attr, server_thread_main, args);
-
-        debug_log("thread", "server_thread_start: AFTER pthread_create rc=%d",
-                  rc);
 
         pthread_attr_destroy(&attr);
 
-        debug_log("thread",
-                  "server_thread_start: pthread_attr_destroy complete");
-
         if (rc != 0) {
                 debug_log("thread",
-                          "server_thread_start: pthread_create FAILED "
-                          "rc=%d",
+                          "server_thread_start: pthread_create FAILED rc=%d",
                           rc);
 
                 pthread_mutex_lock(&thread_mutex);
                 thread_count--;
-
-                debug_log("thread",
-                          "server_thread_start: thread_count=%d after "
-                          "pthread_create failure",
-                          (int)thread_count);
-
                 pthread_mutex_unlock(&thread_mutex);
 
                 free(args);
-
                 return -1;
         }
 

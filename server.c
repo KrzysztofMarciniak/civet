@@ -1,3 +1,5 @@
+/* server.c - listening socket and HTTP connection loop. */
+
 #include "server.h"
 
 #include <arpa/inet.h>
@@ -11,6 +13,10 @@
 
 #include "debug.h"
 #include "server_threads.h"
+
+#ifdef ENABLE_TLS
+#include "tls_interface.h"
+#endif
 
 #define SERVER_BACKLOG 16
 #define EMFILE_BACKOFF_MS 100
@@ -33,7 +39,8 @@ static int make_listener(const struct config* cfg) {
 
         yes = 1;
 
-        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes,
+                       sizeof(yes)) < 0) {
                 perror("civet: setsockopt");
                 close(fd);
                 return -1;
@@ -42,7 +49,7 @@ static int make_listener(const struct config* cfg) {
         memset(&addr, 0, sizeof(addr));
 
         addr.sin_family = AF_INET;
-        addr.sin_port   = htons(cfg->port);
+        addr.sin_port = htons(cfg->port);
 
         if (inet_pton(AF_INET, cfg->bind_addr, &addr.sin_addr) != 1) {
                 fprintf(stderr, "civet: invalid bind address '%s'\n",
@@ -51,12 +58,13 @@ static int make_listener(const struct config* cfg) {
                 return -1;
         }
 
-        debug_log("server", "make_listener: binding %s:%u", cfg->bind_addr,
-                  (unsigned)cfg->port);
+        debug_log("server", "make_listener: binding %s:%u",
+                  cfg->bind_addr, (unsigned)cfg->port);
 
         if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-                fprintf(stderr, "civet: bind %s:%u: %s\n", cfg->bind_addr,
-                        (unsigned)cfg->port, strerror(errno));
+                fprintf(stderr, "civet: bind %s:%u: %s\n",
+                        cfg->bind_addr, (unsigned)cfg->port,
+                        strerror(errno));
                 close(fd);
                 return -1;
         }
@@ -77,27 +85,44 @@ static int make_listener(const struct config* cfg) {
 static void sleep_ms(int ms) {
         struct timespec ts;
 
-        ts.tv_sec  = ms / 1000;
-        ts.tv_nsec = (ms % 1000) * 1000000;
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = (long)(ms % 1000) * 1000000L;
 
-        nanosleep(&ts, NULL);
+        (void)nanosleep(&ts, NULL);
 }
 
+#ifdef ENABLE_TLS
 s4 server_run(const struct config* cfg, struct vfs* vfs,
-              struct vfs_server* vfs_server, struct cache* cache) {
+              struct vfs_server* vfs_server, struct cache* cache,
+              struct tls_context* tls_ctx)
+#else
+s4 server_run(const struct config* cfg, struct vfs* vfs,
+              struct vfs_server* vfs_server, struct cache* cache)
+#endif
+{
         int listener;
         int client_fd;
         s4 rc;
 
         debug_log("server", "server_run: begin");
 
-        if (cfg == NULL || vfs == NULL || vfs_server == NULL || cache == NULL) {
+        if (cfg == NULL || vfs == NULL || vfs_server == NULL ||
+            cache == NULL) {
                 debug_log("server", "server_run: invalid argument");
                 return -1;
         }
 
-        debug_log("server", "server_run: cfg=%p vfs=%p vfs_server=%p cache=%p",
-                  (void*)cfg, (void*)vfs, (void*)vfs_server, (void*)cache);
+#ifdef ENABLE_TLS
+        if (tls_ctx == NULL) {
+                debug_log("server", "server_run: missing TLS context");
+                return -1;
+        }
+#endif
+
+        debug_log("server",
+                  "server_run: cfg=%p vfs=%p vfs_server=%p cache=%p",
+                  (void*)cfg, (void*)vfs, (void*)vfs_server,
+                  (void*)cache);
 
         listener = make_listener(cfg);
 
@@ -106,8 +131,13 @@ s4 server_run(const struct config* cfg, struct vfs* vfs,
                 return -1;
         }
 
-        printf("civet: listening on %s:%u\n", cfg->bind_addr,
-               (unsigned)cfg->port);
+        printf("civet: listening on %s://%s:%u\n",
+#ifdef ENABLE_TLS
+               "https",
+#else
+               "http",
+#endif
+               cfg->bind_addr, (unsigned)cfg->port);
 
         fflush(stdout);
 
@@ -151,7 +181,13 @@ s4 server_run(const struct config* cfg, struct vfs* vfs,
                 debug_log("server", "server_run: starting worker for fd=%d",
                           client_fd);
 
-                rc = server_thread_start(client_fd, vfs, vfs_server, cache);
+#ifdef ENABLE_TLS
+                rc = server_thread_start(client_fd, vfs, vfs_server,
+                                         cache, tls_ctx);
+#else
+                rc = server_thread_start(client_fd, vfs, vfs_server,
+                                         cache);
+#endif
 
                 debug_log("server",
                           "server_run: server_thread_start returned %d",
@@ -162,21 +198,23 @@ s4 server_run(const struct config* cfg, struct vfs* vfs,
                                   "server_run: worker creation failed fd=%d",
                                   client_fd);
 
-                        send(client_fd,
-                             "HTTP/1.1 503 Service Unavailable\r\n"
-                             "Content-Type: text/plain\r\n"
-                             "Content-Length: 13\r\n"
-                             "Connection: close\r\n"
-                             "\r\n"
-                             "server busy\n",
-                             sizeof("HTTP/1.1 503 Service Unavailable\r\n"
-                                    "Content-Type: text/plain\r\n"
-                                    "Content-Length: 13\r\n"
-                                    "Connection: close\r\n"
-                                    "\r\n"
-                                    "server busy\n") -
-                                 1,
-                             0);
+#ifndef ENABLE_TLS
+                        (void)send(
+                            client_fd,
+                            "HTTP/1.1 503 Service Unavailable\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "Content-Length: 13\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                            "server busy\n",
+                            sizeof("HTTP/1.1 503 Service Unavailable\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: 13\r\n"
+                                   "Connection: close\r\n"
+                                   "\r\n"
+                                   "server busy\n") - 1,
+                            0);
+#endif
 
                         close(client_fd);
 

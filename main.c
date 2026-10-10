@@ -1,3 +1,4 @@
+
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -14,6 +15,10 @@
 #include "server.h"
 #include "vfs.h"
 #include "vfs_server.h"
+
+#ifdef ENABLE_TLS
+#include "tls_interface.h"
+#endif
 
 #define PROG_NAME "civet"
 
@@ -67,13 +72,30 @@ int main(int argc, char** argv) {
         int opt;
         s4 r;
 
+#ifdef ENABLE_TLS
+        const char* cert_file;
+        const char* key_file;
+        struct tls_config tls_cfg;
+        struct tls_context* tls_ctx;
+#endif
+
         cfg.bind_addr = "127.0.0.1";
         cfg.port      = 8080;
         cfg.root_arg  = NULL;
         cfg.root[0]   = '\0';
         cfg.cache_arg = NULL;
 
+#ifdef ENABLE_TLS
+        cert_file = NULL;
+        key_file  = NULL;
+        tls_ctx   = NULL;
+#endif
+
+#ifdef ENABLE_TLS
+        while ((opt = getopt(argc, argv, "b:p:r:c:C:K:")) != -1) {
+#else
         while ((opt = getopt(argc, argv, "b:p:r:c:")) != -1) {
+#endif
                 switch (opt) {
                         case 'b':
                                 cfg.bind_addr = optarg;
@@ -97,6 +119,16 @@ int main(int argc, char** argv) {
                                 cfg.cache_arg = optarg;
                                 break;
 
+#ifdef ENABLE_TLS
+                        case 'C':
+                                cert_file = optarg;
+                                break;
+
+                        case 'K':
+                                key_file = optarg;
+                                break;
+#endif
+
                         default:
                                 usage(argv[0]);
                                 return EXIT_USAGE;
@@ -116,12 +148,40 @@ int main(int argc, char** argv) {
         if (resolve_root(cfg.root_arg, cfg.root, sizeof(cfg.root)) != 0)
                 return EXIT_RUNTIME;
 
+#ifdef ENABLE_TLS
+        if (cert_file == NULL || key_file == NULL) {
+                fprintf(stderr,
+                        PROG_NAME
+                        ": TLS build requires -C certificate and -K key\n");
+                usage(argv[0]);
+                return EXIT_USAGE;
+        }
+
+        tls_cfg.certificate_file = cert_file;
+        tls_cfg.private_key_file = key_file;
+        tls_cfg.backend_config = NULL;
+
+        if (tls_context_create(&tls_cfg, &tls_ctx) != 0) {
+                fprintf(stderr, PROG_NAME ": TLS initialization failed: %s\n",
+                        tls_last_error());
+                return EXIT_RUNTIME;
+        }
+#endif
+
         ac_init();
 
-        if (vfs_init(&vfs, cfg.root) != VFS_OK) return EXIT_RUNTIME;
+        if (vfs_init(&vfs, cfg.root) != VFS_OK) {
+#ifdef ENABLE_TLS
+                tls_context_destroy(tls_ctx);
+#endif
+                return EXIT_RUNTIME;
+        }
 
         if (vfs_server_init(&vfs_server, cfg.root) != VFS_OK) {
                 vfs_destroy(&vfs);
+#ifdef ENABLE_TLS
+                tls_context_destroy(tls_ctx);
+#endif
                 return EXIT_RUNTIME;
         }
 
@@ -133,20 +193,35 @@ int main(int argc, char** argv) {
                         cache_destroy(&cache);
                         vfs_server_destroy(&vfs_server);
                         vfs_destroy(&vfs);
+#ifdef ENABLE_TLS
+                        tls_context_destroy(tls_ctx);
+#endif
                         return EXIT_RUNTIME;
                 }
         }
 
         vfs_dump(&vfs);
 
-        fprintf(stderr, PROG_NAME ": serving %s on http://%s:%u/\n", cfg.root,
-                cfg.bind_addr, (unsigned)cfg.port);
+#ifdef ENABLE_TLS
+        fprintf(stderr, PROG_NAME ": serving %s on https://%s:%u/\n",
+                cfg.root, cfg.bind_addr, (unsigned)cfg.port);
+#else
+        fprintf(stderr, PROG_NAME ": serving %s on http://%s:%u/\n",
+                cfg.root, cfg.bind_addr, (unsigned)cfg.port);
+#endif
 
+#ifdef ENABLE_TLS
+        r = server_run(&cfg, &vfs, &vfs_server, &cache, tls_ctx);
+#else
         r = server_run(&cfg, &vfs, &vfs_server, &cache);
-
+#endif
         cache_destroy(&cache);
         vfs_server_destroy(&vfs_server);
         vfs_destroy(&vfs);
+
+#ifdef ENABLE_TLS
+        tls_context_destroy(tls_ctx);
+#endif
 
         return r == 0 ? EXIT_OK : EXIT_RUNTIME;
 }

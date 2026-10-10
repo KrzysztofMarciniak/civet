@@ -11,7 +11,15 @@ PREFIX  ?= /usr/local
 BINDIR   = $(PREFIX)/bin
 DESTDIR ?=
 
-# make DEBUG=1   runtime debug logging + -g
+# Optional TLS configuration:
+#   make tls=1 mbed=1
+#   make tls=1 openssl=1
+#   make tls=1 libressl=1
+tls     ?= 0
+mbed    ?= 0
+openssl ?= 0
+libressl ?= 0
+
 DEBUG ?= 0
 
 ifeq ($(DEBUG),1)
@@ -20,7 +28,63 @@ CFLAGS += -g
 endif
 
 SRCS = main.c allowed_chars.c port.c request_parser.c \
-       vfs.c vfs_server.c cgi-bin.c cache.c server.c server_threads.c help.c debug.c
+       vfs.c vfs_server.c cgi-bin.c cache.c server.c \
+       server_threads.c help.c debug.c send.c
+
+TLS_CPPFLAGS =
+TLS_LDLIBS   =
+TLS_SRCS     =
+
+# TLS backend selection and validation.
+ifeq ($(tls),1)
+
+ifneq ($(words $(filter 1,$(mbed) $(openssl) $(libressl))),1)
+$(error With tls=1, select exactly one backend: mbed=1, openssl=1, or libressl=1)
+endif
+
+SRCS += tls_interface.c
+DEFS += -DENABLE_TLS
+
+ifeq ($(mbed),1)
+TLS_CPPFLAGS += $(shell pkg-config --cflags mbedtls 2>/dev/null)
+TLS_LDLIBS   += $(shell pkg-config --libs mbedtls 2>/dev/null)
+ifeq ($(strip $(TLS_LDLIBS)),)
+TLS_LDLIBS = -lmbedtls -lmbedx509 -lmbedcrypto
+endif
+TLS_SRCS += tls_backend/mbed/main.c
+DEFS += -DTLS_BACKEND_MBED
+
+else ifeq ($(openssl),1)
+TLS_CPPFLAGS += $(shell pkg-config --cflags openssl 2>/dev/null)
+TLS_LDLIBS   += $(shell pkg-config --libs openssl 2>/dev/null)
+ifeq ($(strip $(TLS_LDLIBS)),)
+TLS_LDLIBS = -lssl -lcrypto
+endif
+TLS_SRCS += tls_backend/openssl/main.c
+DEFS += -DTLS_BACKEND_OPENSSL
+
+else ifeq ($(libressl),1)
+TLS_CPPFLAGS += $(shell pkg-config --cflags libressl 2>/dev/null)
+TLS_LDLIBS   += $(shell pkg-config --libs libressl 2>/dev/null)
+ifeq ($(strip $(TLS_LDLIBS)),)
+TLS_LDLIBS = -lssl -lcrypto
+endif
+TLS_SRCS += tls_backend/libressl/main.c
+DEFS += -DTLS_BACKEND_LIBRESSL
+endif
+
+SRCS += $(TLS_SRCS)
+
+else
+
+ifneq ($(filter 1,$(mbed) $(openssl) $(libressl)),)
+$(error TLS backend selected without tls=1; use make tls=1 <backend>=1)
+endif
+
+endif
+
+CPPFLAGS += $(TLS_CPPFLAGS)
+LDLIBS   += $(TLS_LDLIBS)
 
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)

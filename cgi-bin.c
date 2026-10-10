@@ -18,68 +18,46 @@
 
 #include "allowed_chars.h"
 #include "debug.h"
+#include "send.h"
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-static int write_all(int fd, const char* buf, size_t len) {
-        size_t original_len;
+static int write_all(struct client_transport* transport, const char* buf,
+                     size_t len) {
+        debug_log("write_all", "transport=%p len=%lu", (void*)transport,
+                  (unsigned long)len);
 
-        original_len = len;
-
-        debug_log("write_all", "fd=%d len=%lu", fd, (unsigned long)len);
-
-        while (len > 0) {
-                ssize_t n;
-
-                n = write(fd, buf, len);
-
-                if (n < 0) {
-                        if (errno == EINTR) {
-                                debug_log("write_all",
-                                          "fd=%d write interrupted, retrying",
-                                          fd);
-                                continue;
-                        }
-
-                        debug_log("write_all",
-                                  "fd=%d write failed errno=%d (%s)", fd, errno,
-                                  strerror(errno));
-
-                        return -1;
-                }
-
-                if (n == 0) {
-                        debug_log(
-                            "write_all",
-                            "fd=%d write returned zero after %lu/%lu bytes", fd,
-                            (unsigned long)(original_len - len),
-                            (unsigned long)original_len);
-                        return -1;
-                }
-
-                debug_log("write_all", "fd=%d wrote=%ld remaining=%lu", fd,
-                          (long)n, (unsigned long)(len - (size_t)n));
-
-                buf += n;
-                len -= (size_t)n;
+        if (transport == NULL || (buf == NULL && len > 0)) {
+                debug_log("write_all", "invalid arguments");
+                return -1;
         }
 
-        debug_log("write_all", "fd=%d completed len=%lu", fd,
-                  (unsigned long)original_len);
+        if (len == 0) return 0;
+
+        if (client_send_all(transport, buf, len) != 0) {
+                debug_log("write_all",
+                          "client_send_all failed len=%lu errno=%d (%s)",
+                          (unsigned long)len, errno, strerror(errno));
+                return -1;
+        }
+
+        debug_log("write_all", "completed len=%lu", (unsigned long)len);
 
         return 0;
 }
 
-static void send_error(int fd, int code, const char* text) {
+static void send_error(struct client_transport* transport, int code,
+                       const char* text) {
         char buf[256];
         int n;
         size_t text_len;
 
         if (text == NULL) text = "Error";
 
-        debug_log("send_error", "fd=%d code=%d text=\"%s\"", fd, code, text);
+        debug_log("send_error", "transport=%p code=%d text=\"%s\"",
+                  (void*)transport, code, text);
 
         text_len = strlen(text);
 
@@ -93,9 +71,9 @@ static void send_error(int fd, int code, const char* text) {
                      code, text, (unsigned long)(text_len + 1), text);
 
         if (n > 0 && (size_t)n < sizeof(buf)) {
-                if (write_all(fd, buf, (size_t)n) != 0)
+                if (write_all(transport, buf, (size_t)n) != 0)
                         debug_log("send_error",
-                                  "failed writing error response fd=%d", fd);
+                                  "failed writing error response");
         } else {
                 debug_log("send_error",
                           "snprintf failed/truncated code=%d n=%d", code, n);
@@ -762,7 +740,8 @@ static int is_hop_by_hop_header(const char* line, size_t len) {
         return 0;
 }
 
-static s4 send_response(int fd, const char* buf, size_t len, int head_only) {
+static s4 send_response(struct client_transport* transport, const char* buf,
+                        size_t len, int head_only) {
         size_t hdr_len;
         size_t body_off;
         size_t pos;
@@ -776,10 +755,10 @@ static s4 send_response(int fd, const char* buf, size_t len, int head_only) {
         char* hdrs;
         size_t hdrs_len;
 
-        debug_log("send_response", "fd=%d len=%lu head_only=%d", fd,
-                  (unsigned long)len, head_only);
+        debug_log("send_response", "transport=%p len=%lu head_only=%d",
+                  (void*)transport, (unsigned long)len, head_only);
 
-        if (fd < 0 || buf == NULL) {
+        if (transport == NULL || buf == NULL) {
                 debug_log("send_response", "invalid arguments");
                 return VFS_ERROR;
         }
@@ -991,12 +970,12 @@ static s4 send_response(int fd, const char* buf, size_t len, int head_only) {
 
         debug_log("send_response", "writing HTTP status line");
 
-        if (write_all(fd, head, strlen(head)) != 0) goto fail;
+        if (write_all(transport, head, strlen(head)) != 0) goto fail;
 
         debug_log("send_response", "writing %lu response headers",
                   (unsigned long)hdrs_len);
 
-        if (write_all(fd, hdrs, hdrs_len) != 0) goto fail;
+        if (write_all(transport, hdrs, hdrs_len) != 0) goto fail;
 
         if ((size_t)snprintf(head, sizeof(head),
                              "Content-Length: %lu\r\n"
@@ -1011,13 +990,14 @@ static s4 send_response(int fd, const char* buf, size_t len, int head_only) {
         debug_log("send_response", "writing generated Content-Length=%lu",
                   (unsigned long)body_len);
 
-        if (write_all(fd, head, strlen(head)) != 0) goto fail;
+        if (write_all(transport, head, strlen(head)) != 0) goto fail;
 
         if (!head_only) {
                 debug_log("send_response", "writing response body len=%lu",
                           (unsigned long)body_len);
 
-                if (write_all(fd, buf + body_off, body_len) != 0) goto fail;
+                if (write_all(transport, buf + body_off, body_len) != 0)
+                        goto fail;
         } else {
                 debug_log("send_response",
                           "HEAD request; suppressing response body");
@@ -1142,7 +1122,7 @@ static void kill_and_reap(pid_t pid) {
 /* ------------------------------------------------------------------ */
 
 s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
-           const struct cgi_request* req, int out_fd) {
+           const struct cgi_request* req, struct client_transport* transport) {
         char disk[PATH_MAX];
         char dir[PATH_MAX];
         char* argv[2];
@@ -1177,10 +1157,10 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
         struct timespec zero;
         pid_t pid;
 
-        debug_log("cgi_run", "ENTER vfs=%p entry=%p req=%p out_fd=%d",
-                  (void*)vfs, (void*)entry, (void*)req, out_fd);
+        debug_log("cgi_run", "ENTER vfs=%p entry=%p req=%p transport=%p",
+                  (void*)vfs, (void*)entry, (void*)req, (void*)transport);
 
-        if (vfs == NULL || entry == NULL || req == NULL || out_fd < 0) {
+        if (vfs == NULL || entry == NULL || req == NULL || transport == NULL) {
                 debug_log("cgi_run", "invalid arguments");
                 return VFS_ERROR;
         }
@@ -1195,7 +1175,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
                           (unsigned long)req->body_len,
                           (unsigned long)CGI_MAX_BODY);
 
-                send_error(out_fd, 413, "Request Entity Too Large");
+                send_error(transport, 413, "Request Entity Too Large");
                 return VFS_ERROR;
         }
 
@@ -1203,7 +1183,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
                 debug_log("cgi_run", "body_len=%lu but body=NULL",
                           (unsigned long)req->body_len);
 
-                send_error(out_fd, 400, "Bad Request");
+                send_error(transport, 400, "Bad Request");
                 return VFS_ERROR;
         }
 
@@ -1214,7 +1194,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
         if (disk_path_of(vfs, entry, disk, sizeof(disk)) != VFS_OK) {
                 debug_log("cgi_run", "disk_path_of failed");
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_BAD_PATH;
         }
 
@@ -1223,7 +1203,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
         if (strlen(disk) >= sizeof(dir)) {
                 debug_log("cgi_run", "disk path does not fit dir buffer");
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_BAD_PATH;
         }
 
@@ -1234,7 +1214,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
         if (slash == NULL) {
                 debug_log("cgi_run", "could not find slash in CGI path");
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_BAD_PATH;
         }
 
@@ -1247,7 +1227,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
         if (env == NULL) {
                 debug_log("cgi_run", "env_build failed");
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1266,7 +1246,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
                 debug_log("cgi_run", "malloc output buffer failed");
 
                 env_free(env);
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1276,7 +1256,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                 free(buf);
                 env_free(env);
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1293,7 +1273,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
                 free(buf);
                 env_free(env);
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1312,7 +1292,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
                 free(buf);
                 env_free(env);
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1341,7 +1321,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
                 free(buf);
                 env_free(env);
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1444,7 +1424,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                 free(buf);
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1477,7 +1457,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                         free(buf);
 
-                        send_error(out_fd, 500, "Internal Server Error");
+                        send_error(transport, 500, "Internal Server Error");
                         return VFS_ERROR;
                 }
 
@@ -1501,7 +1481,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                 free(buf);
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1526,7 +1506,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                 free(buf);
 
-                send_error(out_fd, 500, "Internal Server Error");
+                send_error(transport, 500, "Internal Server Error");
                 return VFS_ERROR;
         }
 
@@ -1794,7 +1774,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                 free(buf);
 
-                send_error(out_fd, 504, "Gateway Timeout");
+                send_error(transport, 504, "Gateway Timeout");
 
                 return VFS_ERROR;
         }
@@ -1804,7 +1784,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                 free(buf);
 
-                send_error(out_fd, 502, "CGI Output Too Large");
+                send_error(transport, 502, "CGI Output Too Large");
 
                 return VFS_ERROR;
         }
@@ -1814,7 +1794,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                 free(buf);
 
-                send_error(out_fd, 502, "Bad Gateway");
+                send_error(transport, 502, "Bad Gateway");
 
                 return VFS_ERROR;
         }
@@ -1824,7 +1804,7 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
 
                 free(buf);
 
-                send_error(out_fd, 502, "Bad Gateway");
+                send_error(transport, 502, "Bad Gateway");
 
                 return VFS_ERROR;
         }
@@ -1837,11 +1817,11 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
                 if (WIFSIGNALED(status) && WTERMSIG(status) == SIGALRM) {
                         debug_log("cgi_run", "CGI died from SIGALRM");
 
-                        send_error(out_fd, 504, "Gateway Timeout");
+                        send_error(transport, 504, "Gateway Timeout");
                 } else {
                         debug_log("cgi_run", "CGI failed without output");
 
-                        send_error(out_fd, 502, "Bad Gateway");
+                        send_error(transport, 502, "Bad Gateway");
                 }
 
                 return VFS_ERROR;
@@ -1850,12 +1830,12 @@ s4 cgi_run(const struct vfs* vfs, const struct vfs_entry* entry,
         debug_log("cgi_run", "passing %lu CGI output bytes to send_response",
                   (unsigned long)len);
 
-        if (send_response(out_fd, buf, len, head_only) != VFS_OK) {
+        if (send_response(transport, buf, len, head_only) != VFS_OK) {
                 debug_log("cgi_run", "send_response failed");
 
                 free(buf);
 
-                send_error(out_fd, 502, "Bad Gateway");
+                send_error(transport, 502, "Bad Gateway");
 
                 return VFS_ERROR;
         }

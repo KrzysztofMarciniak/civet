@@ -14,6 +14,10 @@
 #include "vfs.h"
 #include "vfs_server.h"
 
+#ifdef ENABLE_TLS
+#include "tls_interface.h"
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -28,13 +32,14 @@ struct config {
         const char* cache_arg;
 };
 
-/*
- * Start the server and run until a fatal server error occurs.
- *
- * main() owns vfs, vfs_server, and cache.
- * server.c only uses them.
- */
+
+#ifdef ENABLE_TLS
+s4 server_run(const struct config* cfg, struct vfs* vfs,
+              struct vfs_server* vfs_server, struct cache* cache,
+              struct tls_context* tls_ctx);
+#else
 s4 server_run(const struct config* cfg, struct vfs* vfs,
               struct vfs_server* vfs_server, struct cache* cache);
+#endif
 
 #endif
