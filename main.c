@@ -150,8 +150,7 @@ int main(int argc, char** argv) {
 
 #ifdef ENABLE_TLS
         if (cert_file == NULL || key_file == NULL) {
-                fprintf(stderr,
-                        PROG_NAME
+                fprintf(stderr, PROG_NAME
                         ": TLS build requires -C certificate and -K key\n");
                 usage(argv[0]);
                 return EXIT_USAGE;
@@ -159,7 +158,7 @@ int main(int argc, char** argv) {
 
         tls_cfg.certificate_file = cert_file;
         tls_cfg.private_key_file = key_file;
-        tls_cfg.backend_config = NULL;
+        tls_cfg.backend_config   = NULL;
 
         if (tls_context_create(&tls_cfg, &tls_ctx) != 0) {
                 fprintf(stderr, PROG_NAME ": TLS initialization failed: %s\n",
@@ -203,11 +202,11 @@ int main(int argc, char** argv) {
         vfs_dump(&vfs);
 
 #ifdef ENABLE_TLS
-        fprintf(stderr, PROG_NAME ": serving %s on https://%s:%u/\n",
-                cfg.root, cfg.bind_addr, (unsigned)cfg.port);
+        fprintf(stderr, PROG_NAME ": serving %s on https://%s:%u/\n", cfg.root,
+                cfg.bind_addr, (unsigned)cfg.port);
 #else
-        fprintf(stderr, PROG_NAME ": serving %s on http://%s:%u/\n",
-                cfg.root, cfg.bind_addr, (unsigned)cfg.port);
+        fprintf(stderr, PROG_NAME ": serving %s on http://%s:%u/\n", cfg.root,
+                cfg.bind_addr, (unsigned)cfg.port);
 #endif
 
 #ifdef ENABLE_TLS

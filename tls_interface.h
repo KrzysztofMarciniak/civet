@@ -41,9 +41,9 @@ struct tls_connection;
  * The interface does not take ownership of these strings.
  */
 struct tls_config {
-    const char *certificate_file;
-    const char *private_key_file;
-    const char *backend_config;
+        const char* certificate_file;
+        const char* private_key_file;
+        const char* backend_config;
 };
 
 /*
@@ -62,13 +62,11 @@ struct tls_config {
  */
 
 /* Initialize the selected backend and create a shared TLS context. */
-int tls_context_create(
-    const struct tls_config *config,
-    struct tls_context **out
-);
+int tls_context_create(const struct tls_config* config,
+                       struct tls_context** out);
 
 /* Destroy the context after all its client connections are destroyed. */
-void tls_context_destroy(struct tls_context *context);
+void tls_context_destroy(struct tls_context* context);
 
 /*
  * Create a per-client TLS connection and perform the server handshake.
@@ -78,42 +76,32 @@ void tls_context_destroy(struct tls_context *context);
  *
  * On failure, *out is NULL.
  */
-int tls_connection_accept(
-    struct tls_context *context,
-    int fd,
-    struct tls_connection **out
-);
+int tls_connection_accept(struct tls_context* context, int fd,
+                          struct tls_connection** out);
 
 /* Read decrypted application data. */
-ssize_t tls_connection_read(
-    struct tls_connection *connection,
-    void *buffer,
-    size_t length
-);
+ssize_t tls_connection_read(struct tls_connection* connection, void* buffer,
+                            size_t length);
 
 /* Write application data, encrypting it through TLS. */
-ssize_t tls_connection_write(
-    struct tls_connection *connection,
-    const void *buffer,
-    size_t length
-);
+ssize_t tls_connection_write(struct tls_connection* connection,
+                             const void* buffer, size_t length);
 
 /* Attempt a graceful TLS shutdown. */
-int tls_connection_shutdown(struct tls_connection *connection);
+int tls_connection_shutdown(struct tls_connection* connection);
 
 /* Release the session and connection object; does not close the socket. */
-void tls_connection_destroy(struct tls_connection *connection);
+void tls_connection_destroy(struct tls_connection* connection);
 
 /* Return the underlying TCP descriptor, or -1 for an invalid connection. */
-int tls_connection_fd(const struct tls_connection *connection);
+int tls_connection_fd(const struct tls_connection* connection);
 
 /*
  * Return a human-readable error for the most recent TLS operation
  * on the calling thread. The returned pointer remains valid until the
  * next TLS operation on that thread.
  */
-const char *tls_last_error(void);
-
+const char* tls_last_error(void);
 
 /*
  * Backend implementer contract.
@@ -127,42 +115,31 @@ const char *tls_last_error(void);
  */
 
 struct tls_backend_ops {
-    const char *name;
+        const char* name;
 
-    int (*context_create)(
-        const struct tls_config *config,
-        void **backend_context
-    );
+        int (*context_create)(const struct tls_config* config,
+                              void** backend_context);
 
-    void (*context_destroy)(void *backend_context);
+        void (*context_destroy)(void* backend_context);
 
-    int (*connection_accept)(
-        void *backend_context,
-        int fd,
-        void **backend_session
-    );
+        int (*connection_accept)(void* backend_context, int fd,
+                                 void** backend_session);
 
-    ssize_t (*connection_read)(
-        void *backend_session,
-        void *buffer,
-        size_t length
-    );
+        ssize_t (*connection_read)(void* backend_session, void* buffer,
+                                   size_t length);
 
-    ssize_t (*connection_write)(
-        void *backend_session,
-        const void *buffer,
-        size_t length
-    );
+        ssize_t (*connection_write)(void* backend_session, const void* buffer,
+                                    size_t length);
 
-    int (*connection_shutdown)(void *backend_session);
+        int (*connection_shutdown)(void* backend_session);
 
-    void (*connection_destroy)(void *backend_session);
+        void (*connection_destroy)(void* backend_session);
 
-    const char *(*last_error)(void);
+        const char* (*last_error)(void);
 };
 
 /* Implemented by the selected TLS backend. */
-const struct tls_backend_ops *tls_backend_get(void);
+const struct tls_backend_ops* tls_backend_get(void);
 
 #ifdef __cplusplus
 }

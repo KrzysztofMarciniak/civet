@@ -32,7 +32,6 @@ struct config {
         const char* cache_arg;
 };
 
-
 #ifdef ENABLE_TLS
 s4 server_run(const struct config* cfg, struct vfs* vfs,
               struct vfs_server* vfs_server, struct cache* cache,
