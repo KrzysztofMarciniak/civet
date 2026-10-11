@@ -91,7 +91,7 @@ DEPS = $(OBJS:.o=.d)
 
 .SUFFIXES:
 .DELETE_ON_ERROR:
-.PHONY: all install uninstall clean
+.PHONY: all install uninstall clean test test-http test-https
 
 all: $(TARGET)
 
@@ -103,6 +103,36 @@ $(TARGET): $(OBJS)
 
 -include $(DEPS)
 
+# Tests live in test/ and are driven by test/run.sh:
+#   make test        HTTP suite, then HTTPS suite (both always run)
+#   make test-http   HTTP suite only (plain civet on :8080)
+#   make test-https  HTTPS suite only (TLS civet on :8443)
+#
+# The HTTPS suite uses a separate OpenSSL-enabled build in build/tls/ so the
+# plaintext objects in the source tree are left untouched. Self-signed test
+# certificates are written to certs/ (gitignored).
+PYTHON  ?= python3
+
+TLS_BUILD_DIR = build/tls
+TLS_BIN       = $(TLS_BUILD_DIR)/$(TARGET)
+TLS_INPUTS    = $(wildcard *.c *.h) $(wildcard tls_backend/*/*.c tls_backend/*/*.h) Makefile
+
+$(TLS_BIN): $(TLS_INPUTS)
+	mkdir -p $(TLS_BUILD_DIR)
+	cp -R $(wildcard *.c *.h) Makefile tls_backend $(TLS_BUILD_DIR)/
+	$(MAKE) -C $(TLS_BUILD_DIR) tls=1 openssl=1
+
+TEST_ENV = PYTHON="$(PYTHON)" BIN="$(CURDIR)/$(TARGET)" TLS_BIN="$(CURDIR)/$(TLS_BIN)"
+
+test: $(TARGET) $(TLS_BIN)
+	$(TEST_ENV) sh test/run.sh all
+
+test-http: $(TARGET)
+	$(TEST_ENV) sh test/run.sh http
+
+test-https: $(TLS_BIN)
+	$(TEST_ENV) sh test/run.sh https
+
 install: $(TARGET)
 	mkdir -p $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
@@ -113,3 +143,4 @@ uninstall:
 
 clean:
 	rm -f $(OBJS) $(DEPS) $(TARGET)
+	rm -rf $(TLS_BUILD_DIR)

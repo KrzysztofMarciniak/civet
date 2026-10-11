@@ -1,6 +1,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,6 +79,10 @@ int main(int argc, char** argv) {
         struct tls_config tls_cfg;
         struct tls_context* tls_ctx;
 #endif
+
+        /* A client may disconnect while we are writing to it; that must
+         * surface as EPIPE from write()/SSL_write(), not kill the server. */
+        signal(SIGPIPE, SIG_IGN);
 
         cfg.bind_addr = "127.0.0.1";
         cfg.port      = 8080;
