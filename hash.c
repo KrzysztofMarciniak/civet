@@ -39,17 +39,17 @@ static int hash_table_grow(struct hash_table* ht) {
                 entry = ht->buckets[i];
 
                 while (entry != NULL) {
-                        next = entry->next;
-                        index = hash_fnv1a(entry->vfs_entry->url_path) %
-                                new_capacity;
+                        next        = entry->next;
+                        index       = hash_fnv1a(entry->vfs_entry->url_path) %
+                                      new_capacity;
                         entry->next = buckets[index];
                         buckets[index] = entry;
-                        entry = next;
+                        entry          = next;
                 }
         }
 
         free(ht->buckets);
-        ht->buckets = buckets;
+        ht->buckets  = buckets;
         ht->capacity = new_capacity;
 
         return 0;
@@ -58,8 +58,7 @@ static int hash_table_grow(struct hash_table* ht) {
 struct hash_table* hash_table_create(size_t capacity) {
         struct hash_table* ht;
 
-        if (capacity == 0 ||
-            capacity > (size_t)-1 / sizeof(*ht->buckets))
+        if (capacity == 0 || capacity > (size_t)-1 / sizeof(*ht->buckets))
                 return NULL;
 
         ht = (struct hash_table*)malloc(sizeof(*ht));

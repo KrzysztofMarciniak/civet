@@ -21,6 +21,12 @@ For a build with runtime debug logging:
 make DEBUG=1
 ```
 
+## Formatting
+
+Run `make format` to apply clang-format, or `make format-check` to check without
+changing files. Set `CLANG_FORMAT=/path/to/clang-format` to select another
+executable.
+
 ## Quick start
 First make sure to compile the hello.bin:
 

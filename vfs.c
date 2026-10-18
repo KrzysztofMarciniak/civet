@@ -148,11 +148,10 @@ s4 vfs_remove(struct vfs* vfs, const char* url_path) {
                         if (vfs->ht != NULL) {
                                 if (replacement != NULL) {
                                         if (hash_table_insert(vfs->ht, url_path,
-                                                              replacement) !=
-                                            0)
+                                                              replacement) != 0)
                                                 return VFS_ERROR;
-                                } else if (hash_table_remove(vfs->ht, url_path) !=
-                                           0) {
+                                } else if (hash_table_remove(vfs->ht,
+                                                             url_path) != 0) {
                                         return VFS_ERROR;
                                 }
                         }

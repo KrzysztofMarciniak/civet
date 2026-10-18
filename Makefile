@@ -91,7 +91,7 @@ DEPS = $(OBJS:.o=.d)
 
 .SUFFIXES:
 .DELETE_ON_ERROR:
-.PHONY: all install uninstall clean test test-http test-https
+.PHONY: all install uninstall clean test test-http test-https format format-check
 
 all: $(TARGET)
 
@@ -111,7 +111,8 @@ $(TARGET): $(OBJS)
 # The HTTPS suite uses a separate OpenSSL-enabled build in build/tls/ so the
 # plaintext objects in the source tree are left untouched. Self-signed test
 # certificates are written to certs/ (gitignored).
-PYTHON  ?= python3
+PYTHON       ?= python3
+CLANG_FORMAT ?= clang-format
 
 TLS_BUILD_DIR = build/tls
 TLS_BIN       = $(TLS_BUILD_DIR)/$(TARGET)
@@ -132,6 +133,12 @@ test-http: $(TARGET)
 
 test-https: $(TLS_BIN)
 	$(TEST_ENV) sh test/run.sh https
+
+format:
+	CLANG_FORMAT="$(CLANG_FORMAT)" ./format.sh
+
+format-check:
+	CLANG_FORMAT="$(CLANG_FORMAT)" ./format.sh --check
 
 install: $(TARGET)
 	mkdir -p $(DESTDIR)$(BINDIR)
