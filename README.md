@@ -132,6 +132,10 @@ bss:           456 bytes
 total:      71,743 bytes (70.1 KiB)
 ```
 
+## Integration Example
+
+**An example usage of this tool:** [example-login-c-stack](https://github.com/KrzysztofMarciniak/example-login-c-stack).
+
 ## License
 
 See the project source for license information.
