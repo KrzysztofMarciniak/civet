@@ -16,6 +16,7 @@
 
 #include "cgi-bin.h"
 #include "debug.h"
+#include "lib.h"
 #include "request_parser.h"
 #include "send.h"
 
@@ -352,7 +353,11 @@ static s4 send_file(int fd, int file_fd, const char* url_path, s4 head_only) {
         struct stat st;
         char buf[SERVER_FILE_BUF];
         ssize_t n;
-        unsigned long long total_sent;
+#ifdef LIB_HAVE_64
+        u8 total_sent;
+#else
+        unsigned long total_sent;
+#endif
 
         total_sent = 0;
 
@@ -412,18 +417,18 @@ static s4 send_file(int fd, int file_fd, const char* url_path, s4 head_only) {
 
                 if (send_all(fd, buf, (size_t)n) < 0) {
                         debug_log("thread",
-                                  "send_file: send failed after %llu bytes",
+                                  "send_file: send failed after %lu bytes",
                                   total_sent);
                         close(file_fd);
                         return -1;
                 }
 
-                total_sent += (unsigned long long)n;
+                total_sent += (unsigned long)n;
         }
 
         close(file_fd);
 
-        debug_log("thread", "send_file: EXIT total_sent=%llu", total_sent);
+        debug_log("thread", "send_file: EXIT total_sent=%lu", total_sent);
 
         return 0;
 }

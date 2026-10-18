@@ -1079,7 +1079,9 @@ static int deadline_poll_ms(const struct timespec* deadline) {
 
         if (sec < 0) return 0;
 
-        ms = (long)sec * 1000LL + (long)(nsec + 999999L) / 1000000LL;
+        if (sec >= 1) return 1000;
+
+        ms = (long)(nsec + 999999L) / 1000000L;
 
         if (ms > 1000) ms = 1000;
 

@@ -28,7 +28,7 @@ CFLAGS += -g
 endif
 
 SRCS = main.c allowed_chars.c port.c request_parser.c \
-       vfs.c vfs_server.c cgi-bin.c cache.c server.c \
+       vfs.c hash.c vfs_server.c cgi-bin.c cache.c server.c \
        server_threads.c help.c debug.c send.c
 
 TLS_CPPFLAGS =

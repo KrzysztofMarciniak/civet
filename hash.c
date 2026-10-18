@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "vfs.h"
+
 /* FNV-1a hash function for strings */
 static size_t hash_fnv1a(const char* str) {
         size_t hash = 2166136261U; /* FNV offset basis for 32-bit */
@@ -16,10 +18,49 @@ static size_t hash_fnv1a(const char* str) {
         return hash;
 }
 
+static int hash_table_grow(struct hash_table* ht) {
+        size_t new_capacity;
+        size_t i;
+        size_t index;
+        struct hash_entry** buckets;
+        struct hash_entry* entry;
+        struct hash_entry* next;
+
+        if (ht->capacity > (size_t)-1 / 2) return -1;
+
+        new_capacity = ht->capacity * 2;
+
+        if (new_capacity > (size_t)-1 / sizeof(*buckets)) return -1;
+
+        buckets = (struct hash_entry**)calloc(new_capacity, sizeof(*buckets));
+        if (buckets == NULL) return -1;
+
+        for (i = 0; i < ht->capacity; i++) {
+                entry = ht->buckets[i];
+
+                while (entry != NULL) {
+                        next = entry->next;
+                        index = hash_fnv1a(entry->vfs_entry->url_path) %
+                                new_capacity;
+                        entry->next = buckets[index];
+                        buckets[index] = entry;
+                        entry = next;
+                }
+        }
+
+        free(ht->buckets);
+        ht->buckets = buckets;
+        ht->capacity = new_capacity;
+
+        return 0;
+}
+
 struct hash_table* hash_table_create(size_t capacity) {
         struct hash_table* ht;
 
-        if (capacity == 0) return NULL;
+        if (capacity == 0 ||
+            capacity > (size_t)-1 / sizeof(*ht->buckets))
+                return NULL;
 
         ht = (struct hash_table*)malloc(sizeof(*ht));
         if (ht == NULL) return NULL;
@@ -75,6 +116,12 @@ int hash_table_insert(struct hash_table* ht, const char* key,
                         return 0;
                 }
                 entry = entry->next;
+        }
+
+        if (ht->size >= ht->capacity - ht->capacity / 4) {
+                if (hash_table_grow(ht) != 0) return -1;
+
+                index = hash_fnv1a(key) % ht->capacity;
         }
 
         /* Insert new entry at the head of the collision chain */

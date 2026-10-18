@@ -113,6 +113,12 @@ s4 vfs_add(struct vfs* vfs, const char* url_path, const char* rel_path,
         entry->size  = st->st_size;
         entry->mtime = st->st_mtime;
 
+        if (vfs->ht != NULL &&
+            hash_table_insert(vfs->ht, url_path, entry) != 0) {
+                free(entry);
+                return VFS_ERROR;
+        }
+
         entry->next  = vfs->entries;
         vfs->entries = entry;
         vfs->entry_count++;
@@ -132,6 +138,25 @@ s4 vfs_remove(struct vfs* vfs, const char* url_path) {
                 entry = *p;
 
                 if (strcmp(entry->url_path, url_path) == 0) {
+                        struct vfs_entry* replacement;
+
+                        replacement = entry->next;
+                        while (replacement != NULL &&
+                               strcmp(replacement->url_path, url_path) != 0)
+                                replacement = replacement->next;
+
+                        if (vfs->ht != NULL) {
+                                if (replacement != NULL) {
+                                        if (hash_table_insert(vfs->ht, url_path,
+                                                              replacement) !=
+                                            0)
+                                                return VFS_ERROR;
+                                } else if (hash_table_remove(vfs->ht, url_path) !=
+                                           0) {
+                                        return VFS_ERROR;
+                                }
+                        }
+
                         *p = entry->next;
                         free(entry);
 
@@ -316,6 +341,13 @@ s4 vfs_init(struct vfs* vfs, const char* root) {
 
         strcpy(vfs->root, real_root);
 
+        vfs->ht = hash_table_create(16);
+        if (vfs->ht == NULL) {
+                fprintf(stderr, "civet: cannot allocate VFS hash table\n");
+                vfs_destroy(vfs);
+                return VFS_ERROR;
+        }
+
         if (vfs_add(vfs, "/", "", &st) != VFS_OK) {
                 vfs_destroy(vfs);
                 return VFS_ERROR;
@@ -337,6 +369,9 @@ void vfs_destroy(struct vfs* vfs) {
         struct vfs_entry* next;
 
         if (vfs == NULL) return;
+
+        hash_table_destroy(vfs->ht);
+        vfs->ht = NULL;
 
         entry = vfs->entries;
 
@@ -480,6 +515,8 @@ const struct vfs_entry* vfs_lookup(const struct vfs* vfs,
         const struct vfs_entry* entry;
 
         if (vfs == NULL || url_path == NULL) return NULL;
+
+        if (vfs->ht != NULL) return hash_table_lookup(vfs->ht, url_path);
 
         for (entry = vfs->entries; entry != NULL; entry = entry->next) {
                 if (strcmp(entry->url_path, url_path) == 0) return entry;
